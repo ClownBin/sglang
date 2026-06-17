@@ -16,6 +16,13 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 
+def _swigluoai_torch(x: torch.Tensor, gemm1_alpha=1.702, gemm1_limit=7.0) -> torch.Tensor:
+    gate, up = x.chunk(2, dim=-1)
+    gate = gate.clamp(min=None, max=gemm1_limit)
+    up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
+    return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
+
+
 def npu_fused_experts_w4a4(
     hidden_states: torch.Tensor,
     w13: torch.Tensor,
@@ -165,11 +172,8 @@ def npu_fused_experts(
     )[0]
     # act_fn: swiglu
     if not use_wna16:
-        hidden_states, pertoken_scale = torch.ops.npu.npu_dequant_swiglu_quant(
-            hidden_states,
-            activate_left=True,
-            quant_mode=1,
-        )
+        hidden_states = _swigluoai_torch(hidden_states)
+        hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_quant(hidden_states)
 
         scale_args2 = {
             "scale": [w2_scale.to(scale_dtype)],

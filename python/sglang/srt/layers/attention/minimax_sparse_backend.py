@@ -24,6 +24,10 @@ if not is_npu():
         minimax_sparse_decode,
         minimax_sparse_prefill,
     )
+else:
+    from sglang.srt.layers.attention.minimax_sparse_ops.npu import (
+        npu_minimax_sparse_prefill,
+    )
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -448,9 +452,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         k_slots = self._cache_as_slots(k_cache)
         v_slots = self._cache_as_slots(v_cache)
         idx_k_slots = self._cache_as_slots(idx_k_cache)
-        idx_v_slots = (
-            None if idx_v_cache is None else self._cache_as_slots(idx_v_cache)
-        )
+        idx_v_slots = None if idx_v_cache is None else self._cache_as_slots(idx_v_cache)
         out = q.new_zeros(q.shape)
         idx_out = None if idx_v_slots is None else idx_q.new_zeros(idx_q.shape)
 
@@ -498,9 +500,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         k_slots = self._cache_as_slots(k_cache)
         v_slots = self._cache_as_slots(v_cache)
         idx_k_slots = self._cache_as_slots(idx_k_cache)
-        idx_v_slots = (
-            None if idx_v_cache is None else self._cache_as_slots(idx_v_cache)
-        )
+        idx_v_slots = None if idx_v_cache is None else self._cache_as_slots(idx_v_cache)
         out = q.new_zeros(q.shape)
         idx_out = None if idx_v_slots is None else idx_q.new_zeros(idx_q.shape)
 
@@ -630,17 +630,31 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             idx_q = idx_q[:actual_num_tokens]
 
         if self.is_npu:
-            idx_o, o = self._forward_npu_sparse_prefill(
+            idx_o, o = npu_minimax_sparse_prefill(
                 q,
                 k_cache,
                 v_cache,
+                None,  # sink (unused on NPU)
                 idx_q,
                 idx_k_cache,
                 idx_v_cache,
-                forward_batch,
+                None,  # idx_sink (unused on NPU)
+                self.req_to_token,
+                forward_batch.req_pool_indices,
                 cu_seqlens,
                 seq_lens,
                 prefix_lens,
+                self._max_seqlen_q,
+                self._max_seqlen_k,
+                self.block_size_q,
+                self.block_size_k,
+                self.topk_blocks,
+                self.init_blocks,
+                self.local_blocks,
+                score_type=self.score_type,
+                disable_index_value=disable_value,
+                use_msa=self.use_msa,
+                seqlens_cpu=forward_batch.extend_seq_lens_cpu,
             )
         else:
             idx_o, o = minimax_sparse_prefill(

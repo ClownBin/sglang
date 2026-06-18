@@ -118,7 +118,9 @@ class ModelSlimW8A8Int8MoE(ModelSlimMoEScheme):
         layer,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        return self.kernel.apply(layer, dispatch_output)
+        return self.kernel.apply(
+            layer, dispatch_output, moe_runner_config=self.moe_runner_config
+        )
 
     def apply_without_routing_weights(
         self,

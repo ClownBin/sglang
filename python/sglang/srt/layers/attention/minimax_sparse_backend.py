@@ -23,6 +23,7 @@ if not is_npu():
     )
 else:
     from sglang.srt.layers.attention.minimax_sparse_ops.npu import (
+        npu_minimax_sparse_decode,
         npu_minimax_sparse_prefill,
     )
 
@@ -262,49 +263,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
-
-    def _forward_npu_sparse_decode(
-        self,
-        q: torch.Tensor,
-        k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
-        idx_q: torch.Tensor,
-        idx_k_cache: torch.Tensor,
-        idx_v_cache: Optional[torch.Tensor],
-        forward_batch: ForwardBatch,
-    ):
-        k_slots = self._cache_as_slots(k_cache)
-        v_slots = self._cache_as_slots(v_cache)
-        idx_k_slots = self._cache_as_slots(idx_k_cache)
-        idx_v_slots = None if idx_v_cache is None else self._cache_as_slots(idx_v_cache)
-        out = q.new_zeros(q.shape)
-        idx_out = None if idx_v_slots is None else idx_q.new_zeros(idx_q.shape)
-
-        for batch_id in range(q.shape[0]):
-            req_idx = int(forward_batch.req_pool_indices[batch_id].item())
-            kv_len = int(forward_batch.seq_lens[batch_id].item())
-            locs = self.req_to_token[req_idx, :kv_len].to(
-                device=k_slots.device, dtype=torch.long
-            )
-            k_tokens = k_slots.index_select(0, locs)
-            v_tokens = v_slots.index_select(0, locs)
-            idx_k_tokens = idx_k_slots.index_select(0, locs)
-            idx_v_tokens = (
-                None if idx_v_slots is None else idx_v_slots.index_select(0, locs)
-            )
-            cur_idx_o, cur_o = self._npu_sparse_one(
-                q[batch_id],
-                k_tokens,
-                v_tokens,
-                idx_q[batch_id],
-                idx_k_tokens,
-                idx_v_tokens,
-                kv_len,
-            )
-            out[batch_id] = cur_o
-            if idx_out is not None:
-                idx_out[batch_id] = cur_idx_o
-        return idx_out, out
 
     @staticmethod
     def _is_sparse_kv_cached_by_fusion(
@@ -576,14 +534,26 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 )
 
         if self.is_npu:
-            idx_o, o = self._forward_npu_sparse_decode(
+            idx_o, o = npu_minimax_sparse_decode(
                 q,
+                None,  # sink (unused on NPU)
                 k_cache,
                 v_cache,
                 idx_q,
+                None,  # idx_sink (unused on NPU)
                 idx_k_cache,
                 idx_v_cache,
-                forward_batch,
+                self.req_to_token,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                self._max_seqlen_k,
+                1,  # block_size_q (always 1 for decode)
+                self.block_size_k,
+                self.topk_blocks,
+                self.init_blocks,
+                self.local_blocks,
+                score_type=self.score_type,
+                disable_index_value=disable_value,
             )
         else:
             idx_o, o = minimax_sparse_decode(

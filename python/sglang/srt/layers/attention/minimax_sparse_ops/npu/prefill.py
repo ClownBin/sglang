@@ -454,6 +454,21 @@ def npu_minimax_sparse_prefill(
     if batch_size == 0:
         return idx_o, o
 
+    # Flatten paged caches to 3D [total_slots, num_heads, head_dim].
+    # sglang's memory pool may use a 4D layout (e.g. page dimension);
+    # index_select over the flattened first dimension works with the
+    # flat slot indices from req_to_token.
+    def _flatten(cache: torch.Tensor) -> torch.Tensor:
+        if cache.dim() <= 3:
+            return cache
+        return cache.reshape(-1, cache.shape[-2], cache.shape[-1])
+
+    k_cache = _flatten(k_cache)
+    v_cache = _flatten(v_cache)
+    idx_k_cache = _flatten(idx_k_cache)
+    if idx_v_cache is not None:
+        idx_v_cache = _flatten(idx_v_cache)
+
     # cu_seqlens is int32 on device; read offsets on host to avoid per-seq
     # syncs inside the loop (mirrors the GPU path's seqlens_cpu rationale).
     cu = cu_seqlens.tolist()

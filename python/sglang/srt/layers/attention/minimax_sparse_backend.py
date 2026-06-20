@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
@@ -279,158 +279,327 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             return cache
         return cache.reshape(-1, cache.shape[-2], cache.shape[-1])
 
-    def _block_topk(self, scores: torch.Tensor, seq_len: int) -> torch.Tensor:
-        num_heads = scores.shape[0]
-        num_blocks = (seq_len + self.block_size_k - 1) // self.block_size_k
-        topk_idx = torch.full(
-            (num_heads, self.topk_blocks),
-            -1,
-            dtype=torch.int32,
-            device=scores.device,
-        )
-        if num_blocks == 0:
-            return topk_idx
+    # ------------------------------------------------------------------
+    # Vectorized pure-PyTorch sparse attention (NPU path)
+    #
+    # Faithful port of the vllm-ascend MiniMax-M3 reference (pure PyTorch,
+    # NPU-proven): block scoring via einsum + causal mask + amax + topk;
+    # merge init/local blocks with dedup; expand blocks to token indices;
+    # gather K/V and run GQA attention with causal masking. Removes the
+    # batch x token x head x block Python loops of the previous fallback
+    # (which produced garbled output and was too slow to serve) and fixes
+    # the divergences from the correct algorithm:
+    #   * score over the FULL seq_len with a causal `valid` mask (not the
+    #     per-query truncated kv_len);
+    #   * merge forced init/local blocks by concatenation + dedup (not the
+    #     1e30/1e29 sentinel injection);
+    #   * dedup the gathered token set (no double-counting of keys).
+    # ------------------------------------------------------------------
 
-        block_scores = []
-        for block_id in range(num_blocks):
-            start = block_id * self.block_size_k
-            end = min(start + self.block_size_k, seq_len)
-            block = scores[:, start:end]
-            if self.score_type == "max":
-                reduced = block.max(dim=-1).values
-            elif self.score_type == "sum":
-                reduced = block.sum(dim=-1)
-            elif self.score_type in ("mean", "avg"):
-                reduced = block.mean(dim=-1)
-            else:
-                self._raise_npu_sparse_not_ready(
-                    "top-k block scoring", f"unsupported score_type={self.score_type!r}"
-                )
-            block_scores.append(reduced)
+    def _merge_sparse_blocks(
+        self,
+        topk_blocks: torch.Tensor,      # [q_len, num_idx_heads, topk_blocks]
+        query_positions: torch.Tensor,  # [q_len]
+        num_blocks: int,
+    ) -> torch.Tensor:                  # [q_len, num_idx_heads, total_width]
+        """Append forced init/local blocks to the top-k block ids and dedup.
 
-        score_tensor = torch.stack(block_scores, dim=-1)
+        Port of vllm-ascend ``_merge_minimax_sparse_blocks``. M3 uses
+        ``init_block=0, local_block=1`` which hits the fast path.
+        """
+        bs = self.block_size_k
+        total = self.topk_blocks + self.init_blocks + self.local_blocks
+        if self.init_blocks <= 0 and self.local_blocks <= 0:
+            return topk_blocks
+
+        q_len = query_positions.shape[0]
+        num_idx_heads = topk_blocks.shape[1]
+        qcol = query_positions[:, None, None]
+
+        if self.init_blocks == 0 and self.local_blocks == 1:
+            # Fast path (M3): append the query's own block once, dedup vs top-k.
+            local = (query_positions // bs).clamp(min=0, max=max(num_blocks - 1, 0))
+            local = local.to(topk_blocks.dtype).view(q_len, 1, 1).expand(
+                -1, num_idx_heads, -1
+            )
+            valid_topk = (topk_blocks >= 0) & (topk_blocks < num_blocks)
+            valid_topk = valid_topk & (topk_blocks * bs <= qcol)
+            local_duplicate = ((topk_blocks == local) & valid_topk).any(
+                dim=-1, keepdim=True
+            )
+            valid_local = (local >= 0) & (local < num_blocks)
+            valid_local = valid_local & (local * bs <= qcol) & ~local_duplicate
+            return torch.cat(
+                [
+                    torch.where(
+                        valid_topk, topk_blocks, torch.full_like(topk_blocks, -1)
+                    ),
+                    torch.where(valid_local, local, torch.full_like(local, -1)),
+                ],
+                dim=-1,
+            )
+
+        # General path (init > 0 or local > 1).
+        forced_parts = []
         if self.init_blocks > 0:
-            score_tensor[:, : min(self.init_blocks, num_blocks)] = 1e30
+            forced_parts.append(
+                torch.arange(
+                    self.init_blocks,
+                    device=topk_blocks.device,
+                    dtype=topk_blocks.dtype,
+                )
+                .view(1, 1, -1)
+                .expand(q_len, num_idx_heads, -1)
+            )
         if self.local_blocks > 0:
-            local_start = max(0, num_blocks - self.local_blocks)
-            score_tensor[:, local_start:num_blocks] = 1e29
+            off = torch.arange(
+                self.local_blocks, device=topk_blocks.device, dtype=query_positions.dtype
+            )
+            block_ids = query_positions // bs
+            first = (block_ids - self.local_blocks + 1).clamp(min=0)
+            forced_parts.append(
+                (first[:, None] + off[None, :])
+                .to(topk_blocks.dtype)
+                .view(q_len, 1, -1)
+                .expand(-1, num_idx_heads, -1)
+            )
+        forced = torch.cat(forced_parts, dim=-1)
+        candidates = torch.cat([forced, topk_blocks], dim=-1)
+        valid = (candidates >= 0) & (candidates < num_blocks)
+        valid = valid & (candidates * bs <= qcol)
+        invalid_value = torch.full_like(candidates, num_blocks)
+        sorted_candidates = torch.sort(
+            torch.where(valid, candidates, invalid_value), dim=-1
+        ).values
+        sorted_valid = sorted_candidates < num_blocks
+        previous = torch.cat(
+            [
+                torch.full_like(sorted_candidates[..., :1], -1),
+                sorted_candidates[:, :, :-1],
+            ],
+            dim=-1,
+        )
+        keep = sorted_valid & (sorted_candidates != previous)
+        ranks = torch.cumsum(keep.to(torch.int32), dim=-1) - 1
+        output = torch.full(
+            (q_len, num_idx_heads, total + 1),
+            -1,
+            dtype=topk_blocks.dtype,
+            device=topk_blocks.device,
+        )
+        overflow_rank = torch.full_like(ranks, total)
+        scatter_index = torch.where(
+            keep & (ranks < total), ranks, overflow_rank
+        ).long()
+        scatter_src = torch.where(keep, sorted_candidates, -1)
+        output.scatter_(2, scatter_index, scatter_src)
+        return output[:, :, :total]
+
+    def _select_sparse_blocks(
+        self,
+        idx_q_seq: torch.Tensor,          # [q_len, num_idx_heads, idx_head_dim]
+        idx_k_seq: torch.Tensor,          # [seq_len, idx_head_dim]
+        query_positions: torch.Tensor,    # [q_len]
+        seq_len: int,
+    ) -> torch.Tensor:                    # [q_len, num_idx_heads, total_width]
+        """Score blocks with the index head, top-k select, merge init/local."""
+        bs = self.block_size_k
+        num_blocks = (seq_len + bs - 1) // bs
+        if num_blocks == 0:
+            total = self.topk_blocks + self.init_blocks + self.local_blocks
+            return torch.full(
+                (idx_q_seq.shape[0], idx_q_seq.shape[1], total),
+                -1,
+                dtype=torch.int32,
+                device=idx_q_seq.device,
+            )
+
+        scores = torch.einsum(
+            "qhd,kd->qhk", idx_q_seq.float(), idx_k_seq.float()
+        )  # [q_len, num_idx_heads, seq_len]
+        padded = num_blocks * bs
+        if padded != seq_len:
+            scores = torch.nn.functional.pad(
+                scores, (0, padded - seq_len), value=-1.0e30
+            )
+        key_pos = torch.arange(
+            padded, device=idx_q_seq.device, dtype=query_positions.dtype
+        )
+        # Causal + out-of-range mask: a key is valid only if it is a real token
+        # at or before the query position.
+        valid = (key_pos[None, :] < seq_len) & (
+            key_pos[None, :] <= query_positions[:, None]
+        )  # [q_len, padded]
+        scores = scores.masked_fill(~valid[:, None, :], -1.0e30)
+
+        q_len, num_idx_heads, _ = idx_q_seq.shape
+        blocked = scores.view(q_len, num_idx_heads, num_blocks, bs)
+        if self.score_type == "max":
+            block_scores = blocked.amax(dim=-1)
+        elif self.score_type == "sum":
+            block_scores = blocked.sum(dim=-1)
+        elif self.score_type in ("mean", "avg"):
+            block_scores = blocked.mean(dim=-1)
+        else:
+            self._raise_npu_sparse_not_ready(
+                "top-k block scoring", f"unsupported score_type={self.score_type!r}"
+            )
 
         actual_topk = min(self.topk_blocks, num_blocks)
-        _, indices = torch.topk(score_tensor, k=actual_topk, dim=-1)
-        topk_idx[:, :actual_topk] = indices.to(torch.int32)
-        return topk_idx
+        blocks = torch.topk(block_scores, k=actual_topk, dim=-1).indices.to(
+            torch.int32
+        )  # [q_len, num_idx_heads, actual_topk]
+        if actual_topk < self.topk_blocks:
+            blocks = torch.nn.functional.pad(
+                blocks, (0, self.topk_blocks - actual_topk), value=-1
+            )
+        return self._merge_sparse_blocks(blocks, query_positions, num_blocks)
 
-    def _token_indices_from_blocks(
-        self, block_idx: torch.Tensor, seq_len: int, device: torch.device
+    def _expand_blocks_to_tokens(
+        self, block_indices: torch.Tensor, seq_len: int
     ) -> torch.Tensor:
-        chunks = []
-        for block in block_idx.tolist():
-            if block < 0:
-                continue
-            start = int(block) * self.block_size_k
-            end = min(start + self.block_size_k, seq_len)
-            if start < end:
-                chunks.append(torch.arange(start, end, device=device))
-        if len(chunks) == 0:
-            return torch.empty(0, dtype=torch.long, device=device)
-        return torch.cat(chunks).to(torch.long)
+        # block_indices: [q_len, num_idx_heads, total_width] -> [q_len, num_idx_heads, M]
+        bs = self.block_size_k
+        off = torch.arange(bs, device=block_indices.device, dtype=block_indices.dtype)
+        tok = block_indices[..., None] * bs + off  # [..., total_width, bs]
+        ok = (block_indices[..., None] >= 0) & (tok < seq_len)
+        tok = tok.flatten(start_dim=-2)  # [..., total_width*bs]
+        return torch.where(
+            ok.flatten(start_dim=-2), tok, torch.full_like(tok, -1)
+        )
 
     @staticmethod
-    def _dense_attention_heads(
-        q_heads: torch.Tensor,
-        k_tokens: torch.Tensor,
-        v_tokens: torch.Tensor,
-        scale: float,
-    ) -> torch.Tensor:
-        num_q_heads = q_heads.shape[0]
-        num_kv_heads = k_tokens.shape[1]
-        group_size = max(1, num_q_heads // num_kv_heads)
-        out = q_heads.new_zeros((num_q_heads, v_tokens.shape[-1]))
-        if k_tokens.shape[0] == 0:
-            return out
-
-        for qh in range(num_q_heads):
-            kvh = min(qh // group_size, num_kv_heads - 1)
-            scores = torch.matmul(
-                q_heads[qh].float(), k_tokens[:, kvh, :].float().transpose(0, 1)
-            )
-            probs = torch.softmax(scores * scale, dim=-1, dtype=torch.float32)
-            out[qh] = torch.matmul(probs.to(v_tokens.dtype), v_tokens[:, kvh, :])
-        return out
-
-    def _sparse_attention_heads(
-        self,
-        q_heads: torch.Tensor,
-        k_tokens: torch.Tensor,
-        v_tokens: torch.Tensor,
-        topk_idx: torch.Tensor,
+    def _sparse_attention_group(
+        q_group: torch.Tensor,            # [q_len, group, head_dim]
+        k_kvhead: torch.Tensor,           # [seq_len, head_dim]  (one kv head)
+        v_kvhead: torch.Tensor,           # [seq_len, head_dim]
+        token_idx: torch.Tensor,          # [q_len, M]  (-1 padded)
+        query_positions: torch.Tensor,    # [q_len]
         seq_len: int,
         scale: float,
-    ) -> torch.Tensor:
-        num_q_heads = q_heads.shape[0]
-        num_kv_heads = k_tokens.shape[1]
-        group_size = max(1, num_q_heads // num_kv_heads)
-        out = q_heads.new_zeros((num_q_heads, v_tokens.shape[-1]))
+    ) -> torch.Tensor:                    # [q_len, group, head_dim]
+        """Main sparse attention for one GQA group over the selected tokens."""
+        q_len, group, head_dim = q_group.shape
+        M = token_idx.shape[-1]
+        if M == 0:
+            return q_group.new_zeros(q_group.shape)
+        # Causal + validity mask over the gathered token set.
+        valid = (token_idx >= 0) & (token_idx < seq_len) & (
+            token_idx <= query_positions[:, None]
+        )  # [q_len, M]
+        # Clamp before gather (-1 / >= seq_len would break index_select), then
+        # mask the corresponding scores before softmax.
+        safe = token_idx.clamp(0, max(seq_len - 1, 0)).long().reshape(-1)  # [q_len*M]
+        k_sel = k_kvhead.index_select(0, safe).view(q_len, M, head_dim)
+        v_sel = v_kvhead.index_select(0, safe).view(q_len, M, head_dim)
+        scores = torch.einsum(
+            "qhd,qkd->qhk", q_group.float(), k_sel.float()
+        )  # [q_len, group, M]
+        scores = scores * scale
+        scores = scores.masked_fill(~valid[:, None, :], -1.0e30)
+        probs = torch.softmax(scores, dim=-1)
+        return torch.einsum(
+            "qhk,qkd->qhd", probs.to(v_sel.dtype), v_sel
+        )  # [q_len, group, head_dim]
 
-        for qh in range(num_q_heads):
-            kvh = min(qh // group_size, num_kv_heads - 1)
-            token_idx = self._token_indices_from_blocks(
-                topk_idx[kvh], seq_len, q_heads.device
-            )
-            if token_idx.numel() == 0:
-                continue
-            k_selected = k_tokens.index_select(0, token_idx)[:, kvh, :]
-            v_selected = v_tokens.index_select(0, token_idx)[:, kvh, :]
-            scores = torch.matmul(
-                q_heads[qh].float(), k_selected.float().transpose(0, 1)
-            )
-            probs = torch.softmax(scores * scale, dim=-1, dtype=torch.float32)
-            out[qh] = torch.matmul(probs.to(v_selected.dtype), v_selected)
-        return out
-
-    def _npu_sparse_one(
-        self,
-        q_token: torch.Tensor,
-        k_tokens: torch.Tensor,
-        v_tokens: torch.Tensor,
-        idx_q_token: torch.Tensor,
-        idx_k_tokens: torch.Tensor,
-        idx_v_tokens: Optional[torch.Tensor],
+    @staticmethod
+    def _index_dense_attention(
+        idx_q_seq: torch.Tensor,          # [q_len, num_idx_heads, idx_head_dim]
+        idx_k_seq: torch.Tensor,          # [seq_len, idx_head_dim]
+        idx_v_seq: torch.Tensor,          # [seq_len, idx_head_dim]
+        query_positions: torch.Tensor,    # [q_len]
         seq_len: int,
-    ):
-        idx_scale = self.idx_head_dim**-0.5
-        main_scale = q_token.shape[-1] ** -0.5
-        idx_scores = torch.matmul(
-            idx_q_token.float(), idx_k_tokens[:, 0, :].float().transpose(0, 1)
+        scale: float,
+    ) -> torch.Tensor:                    # [q_len, num_idx_heads, idx_head_dim]
+        """Index value attention: full dense causal attention over index K/V."""
+        scores = torch.einsum(
+            "qhd,kd->qhk", idx_q_seq.float(), idx_k_seq.float()
+        )  # [q_len, num_idx_heads, seq_len]
+        scores = scores * scale
+        key_pos = torch.arange(
+            seq_len, device=idx_q_seq.device, dtype=query_positions.dtype
         )
-        idx_topk = self._block_topk(idx_scores * idx_scale, seq_len)
+        valid = key_pos[None, :] <= query_positions[:, None]  # [q_len, seq_len]
+        scores = scores.masked_fill(~valid[:, None, :], -1.0e30)
+        probs = torch.softmax(scores, dim=-1)
+        return torch.einsum(
+            "qhk,kd->qhd", probs.to(idx_v_seq.dtype), idx_v_seq
+        )  # [q_len, num_idx_heads, idx_head_dim]
 
-        idx_o = None
-        if idx_v_tokens is not None:
-            idx_o = self._dense_attention_heads(
-                idx_q_token, idx_k_tokens, idx_v_tokens, idx_scale
+    def _npu_sparse_seq(
+        self,
+        q_seq: torch.Tensor,                       # [q_len, num_q_heads, head_dim]
+        k_seq: torch.Tensor,                       # [seq_len, num_kv_heads, head_dim]
+        v_seq: torch.Tensor,                       # [seq_len, num_kv_heads, head_dim]
+        idx_q_seq: torch.Tensor,                   # [q_len, num_idx_heads, idx_head_dim]
+        idx_k_seq: torch.Tensor,                   # [seq_len, idx_head_dim]
+        idx_v_seq: Optional[torch.Tensor],         # [seq_len, idx_head_dim] or None
+        query_positions: torch.Tensor,             # [q_len] absolute positions
+        seq_len: int,
+    ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+        """Run the full sparse attention for one sequence (vectorized)."""
+        if seq_len <= 0:
+            idx_o = None if idx_v_seq is None else idx_q_seq.new_zeros(idx_q_seq.shape)
+            return idx_o, q_seq.new_zeros(q_seq.shape)
+
+        num_q_heads = q_seq.shape[1]
+        num_kv_heads = k_seq.shape[1]
+        num_idx_heads = idx_q_seq.shape[1]
+        head_dim = q_seq.shape[-1]
+        if num_q_heads % num_kv_heads != 0:
+            self._raise_npu_sparse_not_ready(
+                "main sparse attention",
+                f"num_q_heads={num_q_heads} not divisible by "
+                f"num_kv_heads={num_kv_heads}",
             )
-
-        num_idx_heads = idx_q_token.shape[0]
-        num_kv_heads = k_tokens.shape[1]
+        group = num_q_heads // num_kv_heads
         if num_idx_heads % num_kv_heads != 0:
             self._raise_npu_sparse_not_ready(
                 "main sparse attention",
-                f"num_idx_heads={num_idx_heads} is not divisible by "
+                f"num_idx_heads={num_idx_heads} not divisible by "
                 f"num_kv_heads={num_kv_heads}",
             )
         idx_group_size = num_idx_heads // num_kv_heads
-        if idx_group_size > 1:
-            main_topk = topk_index_reduce(
-                idx_topk.view(num_kv_heads, idx_group_size, -1), dim=1
-            )
-        else:
-            main_topk = idx_topk
 
-        out = self._sparse_attention_heads(
-            q_token, k_tokens, v_tokens, main_topk, seq_len, main_scale
+        main_scale = head_dim**-0.5
+        idx_scale = idx_q_seq.shape[-1] ** -0.5
+
+        # A/B: block selection -> token indices [q_len, num_idx_heads, M]
+        blocks = self._select_sparse_blocks(
+            idx_q_seq, idx_k_seq, query_positions, seq_len
         )
-        return idx_o, out
+        tok = self._expand_blocks_to_tokens(blocks, seq_len)  # [q_len, num_idx_heads, M]
+
+        # C: reduce index heads -> kv heads (no-op when idx_group_size == 1)
+        M = tok.shape[-1]
+        if idx_group_size > 1:
+            main_tok = topk_index_reduce(
+                tok.view(-1, num_kv_heads, idx_group_size, M), dim=2
+            )  # [q_len, num_kv_heads, M*idx_group_size]
+        else:
+            main_tok = tok  # [q_len, num_idx_heads == num_kv_heads, M]
+
+        # D: main sparse attention per kv head
+        out = q_seq.new_zeros(q_seq.shape)
+        for kh in range(num_kv_heads):
+            q_group = q_seq[:, kh * group : (kh + 1) * group, :]
+            out[:, kh * group : (kh + 1) * group, :] = self._sparse_attention_group(
+                q_group,
+                k_seq[:, kh, :],
+                v_seq[:, kh, :],
+                main_tok[:, kh, :],
+                query_positions,
+                seq_len,
+                main_scale,
+            )
+
+        # E: index value attention (value-enabled layers only)
+        idx_out = None
+        if idx_v_seq is not None:
+            idx_out = self._index_dense_attention(
+                idx_q_seq, idx_k_seq, idx_v_seq, query_positions, seq_len, idx_scale
+            )
+        return idx_out, out
 
     def _forward_npu_sparse_prefill(
         self,
@@ -454,35 +623,49 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         out = q.new_zeros(q.shape)
         idx_out = None if idx_v_slots is None else idx_q.new_zeros(idx_q.shape)
 
-        for batch_id in range(forward_batch.req_pool_indices.shape[0]):
-            req_idx = int(forward_batch.req_pool_indices[batch_id].item())
+        req_pool_indices = forward_batch.req_pool_indices
+        for batch_id in range(req_pool_indices.shape[0]):
+            req_idx = int(req_pool_indices[batch_id].item())
             q_start = int(cu_seqlens[batch_id].item())
             q_end = int(cu_seqlens[batch_id + 1].item())
+            if q_end <= q_start:
+                continue
             prefix_len = int(prefix_lens[batch_id].item())
             total_len = int(seq_lens[batch_id].item())
-            for offset, q_pos in enumerate(range(q_start, q_end)):
-                kv_len = min(prefix_len + offset + 1, total_len)
-                locs = self.req_to_token[req_idx, :kv_len].to(
-                    device=k_slots.device, dtype=torch.long
-                )
-                k_tokens = k_slots.index_select(0, locs)
-                v_tokens = v_slots.index_select(0, locs)
-                idx_k_tokens = idx_k_slots.index_select(0, locs)
-                idx_v_tokens = (
-                    None if idx_v_slots is None else idx_v_slots.index_select(0, locs)
-                )
-                cur_idx_o, cur_o = self._npu_sparse_one(
-                    q[q_pos],
-                    k_tokens,
-                    v_tokens,
-                    idx_q[q_pos],
-                    idx_k_tokens,
-                    idx_v_tokens,
-                    kv_len,
-                )
-                out[q_pos] = cur_o
-                if idx_out is not None:
-                    idx_out[q_pos] = cur_idx_o
+            q_len = q_end - q_start
+
+            # Gather the full causal KV window [0, total_len) once for the seq.
+            locs = self.req_to_token[req_idx, :total_len].to(
+                device=k_slots.device, dtype=torch.long
+            )
+            k_seq = k_slots.index_select(0, locs)
+            v_seq = v_slots.index_select(0, locs)
+            idx_k_seq = idx_k_slots.index_select(0, locs)[:, 0, :]
+            idx_v_seq = (
+                None
+                if idx_v_slots is None
+                else idx_v_slots.index_select(0, locs)[:, 0, :]
+            )
+            # Absolute query positions: prefix tokens precede the extend chunk.
+            query_positions = torch.arange(
+                prefix_len,
+                prefix_len + q_len,
+                device=q.device,
+                dtype=torch.long,
+            )
+            idx_o_seq, o_seq = self._npu_sparse_seq(
+                q[q_start:q_end],
+                k_seq,
+                v_seq,
+                idx_q[q_start:q_end],
+                idx_k_seq,
+                idx_v_seq,
+                query_positions,
+                total_len,
+            )
+            out[q_start:q_end] = o_seq
+            if idx_out is not None:
+                idx_out[q_start:q_end] = idx_o_seq
         return idx_out, out
 
     def _forward_npu_sparse_decode(
@@ -504,30 +687,40 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         out = q.new_zeros(q.shape)
         idx_out = None if idx_v_slots is None else idx_q.new_zeros(idx_q.shape)
 
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
         for batch_id in range(q.shape[0]):
-            req_idx = int(forward_batch.req_pool_indices[batch_id].item())
-            kv_len = int(forward_batch.seq_lens[batch_id].item())
-            locs = self.req_to_token[req_idx, :kv_len].to(
+            req_idx = int(req_pool_indices[batch_id].item())
+            total_len = int(seq_lens[batch_id].item())
+
+            locs = self.req_to_token[req_idx, :total_len].to(
                 device=k_slots.device, dtype=torch.long
             )
-            k_tokens = k_slots.index_select(0, locs)
-            v_tokens = v_slots.index_select(0, locs)
-            idx_k_tokens = idx_k_slots.index_select(0, locs)
-            idx_v_tokens = (
-                None if idx_v_slots is None else idx_v_slots.index_select(0, locs)
+            k_seq = k_slots.index_select(0, locs)
+            v_seq = v_slots.index_select(0, locs)
+            idx_k_seq = idx_k_slots.index_select(0, locs)[:, 0, :]
+            idx_v_seq = (
+                None
+                if idx_v_slots is None
+                else idx_v_slots.index_select(0, locs)[:, 0, :]
             )
-            cur_idx_o, cur_o = self._npu_sparse_one(
-                q[batch_id],
-                k_tokens,
-                v_tokens,
-                idx_q[batch_id],
-                idx_k_tokens,
-                idx_v_tokens,
-                kv_len,
+            # Decode: single query at the last position of the sequence.
+            query_positions = torch.tensor(
+                [max(total_len - 1, 0)], device=q.device, dtype=torch.long
             )
-            out[batch_id] = cur_o
+            idx_o_seq, o_seq = self._npu_sparse_seq(
+                q[batch_id : batch_id + 1],
+                k_seq,
+                v_seq,
+                idx_q[batch_id : batch_id + 1],
+                idx_k_seq,
+                idx_v_seq,
+                query_positions,
+                total_len,
+            )
+            out[batch_id : batch_id + 1] = o_seq
             if idx_out is not None:
-                idx_out[batch_id] = cur_idx_o
+                idx_out[batch_id : batch_id + 1] = idx_o_seq
         return idx_out, out
 
     @staticmethod

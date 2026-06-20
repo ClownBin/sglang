@@ -16,6 +16,21 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 
+def npu_swiglu_oai(x: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
+    """MiniMax SwigluOAI activation: ``(up + 1) * gate * sigmoid(gate * alpha)``.
+
+    ``gate`` is clamped to ``(-inf, limit]`` and ``up`` to ``[-limit, limit]``.
+    ``x`` is the concatenated ``[gate | up]`` tensor (last dim = 2 * intermediate).
+    Matches ``MiniMaxM3MLP._swigluoai_torch``. Use this instead of
+    ``torch.ops.npu.npu_swiglu`` (which is standard SwiGLU ``silu(gate)*up``)
+    for models whose ``hidden_act == "swigluoai"`` (e.g. MiniMax-M3).
+    """
+    d = x.shape[-1] // 2
+    gate = x[..., :d].clamp(max=limit)
+    up = x[..., d:].clamp(min=-limit, max=limit)
+    return gate * torch.sigmoid(gate * alpha) * (up + 1)
+
+
 def npu_fused_experts_w4a4(
     hidden_states: torch.Tensor,
     w13: torch.Tensor,
@@ -713,54 +728,44 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         group_list,
         output_dtype,
     ):
-        # gmm1: gate_up_proj
+        # SwigluOAI activation params (stashed on the layer by the modelslim MoE
+        # scheme at create_moe_runner time). MiniMax-M3 uses hidden_act
+        # "swigluoai"; the fused npu_dequant_swiglu_quant / npu_swiglu path is
+        # standard SwiGLU and would corrupt the MoE (57/60) layers. When the
+        # params are present, run an UNFUSED path: gmm1 -> bf16 (dequant fused
+        # into the matmul output) -> SwigluOAI -> npu_dynamic_quant -> gmm2.
+        swiglu_alpha = getattr(layer, "swiglu_alpha", None)
+        swiglu_limit = getattr(layer, "swiglu_clamp_limit", None)
+        use_swiglu_oai = swiglu_alpha is not None and swiglu_limit is not None
+
+        # gmm1: gate_up_proj -> dequantized bf16 (fused into the matmul output)
         if hidden_states_scale is None:
-            # BF16 DeepEP dispatch does not carry activation scales. Quantize the
-            # received activations here before feeding the W8A8 grouped matmul.
+            # BF16 DeepEP dispatch carries no activation scale; quantize here.
             hidden_states, hidden_states_scale = torch.ops.npu.npu_dynamic_quant(
                 hidden_states
             )
-            hidden_states = torch.ops.npu.npu_grouped_matmul(
-                x=[hidden_states],
-                weight=[layer.w13_weight],
-                scale=[layer.w13_weight_scale_bf16],
-                per_token_scale=[hidden_states_scale],
-                split_item=2,
-                group_list_type=group_list_type,
-                group_type=0,
-                group_list=group_list,
-                output_dtype=output_dtype,
-            )[0]
+        hidden_states = torch.ops.npu.npu_grouped_matmul(
+            x=[hidden_states],
+            weight=[layer.w13_weight],
+            scale=[layer.w13_weight_scale_bf16],
+            per_token_scale=[hidden_states_scale],
+            split_item=2,
+            group_list_type=group_list_type,
+            group_type=0,
+            group_list=group_list,
+            output_dtype=output_dtype,
+        )[0]
 
-            # act_fn: swiglu
-            hidden_states, swiglu_out_scale = torch.ops.npu.npu_dequant_swiglu_quant(
-                x=hidden_states,
-                quant_mode=1,
-                activate_left=True,
+        # act_fn: SwigluOAI (model hidden_act=swigluoai) or standard swiglu
+        if use_swiglu_oai:
+            hidden_states = npu_swiglu_oai(
+                hidden_states, swiglu_alpha, swiglu_limit
             )
         else:
-            hidden_states = torch.ops.npu.npu_grouped_matmul(
-                x=[hidden_states],
-                weight=[layer.w13_weight],
-                split_item=2,
-                group_list_type=group_list_type,
-                group_type=0,
-                group_list=group_list,
-                output_dtype=torch.int32,
-            )[0]
-
-            # act_fn: swiglu
-            hidden_states, swiglu_out_scale = torch.ops.npu.npu_dequant_swiglu_quant(
-                x=hidden_states,
-                weight_scale=layer.w13_weight_scale,
-                activation_scale=hidden_states_scale,
-                bias=None,
-                quant_scale=None,
-                quant_offset=None,
-                group_index=group_list,
-                activate_left=True,
-                quant_mode=1,
-            )
+            hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+        hidden_states, swiglu_out_scale = torch.ops.npu.npu_dynamic_quant(
+            hidden_states
+        )
 
         # gmm2: down_proj
         hidden_states = torch.ops.npu.npu_grouped_matmul(

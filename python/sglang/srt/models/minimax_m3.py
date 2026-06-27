@@ -130,6 +130,9 @@ if _is_hip:
         _has_rocm_qk_norm_rope = False
 
 if _is_npu:
+    from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+        npu_swiglu_oai,
+    )
     from sgl_kernel_npu.norm.split_qkv_tp_rmsnorm_rope import split_qkv_tp_rmsnorm_rope
 
 logger = logging.getLogger(__name__)
@@ -295,7 +298,7 @@ class MiniMaxM3MLP(nn.Module):
             self.act_fn = SiluAndMul()
         elif hidden_act == "swigluoai":
             if _is_npu:
-                self.act_fn = lambda x: self._swigluoai_torch(
+                self.act_fn = lambda x: npu_swiglu_oai(
                     x, config.swiglu_alpha, config.swiglu_limit
                 )
             else:

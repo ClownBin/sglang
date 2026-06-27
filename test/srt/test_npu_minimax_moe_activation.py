@@ -60,3 +60,20 @@ def test_npu_swiglu_oai_matches_minimax_formula_and_differs_from_standard_swiglu
 
     torch.testing.assert_close(out, expected)
     assert not torch.allclose(out, standard_swiglu)
+
+
+def test_npu_swiglu_oai_env_flag_parser(monkeypatch):
+    module = _load_npu_fused_moe_module()
+
+    env_name = "SGLANG_MINIMAX_M3_NPU_FUSED_SWIGLU_OAI"
+    monkeypatch.delenv(env_name, raising=False)
+    assert module._env_flag_enabled(env_name, True)
+
+    monkeypatch.setenv(env_name, "0")
+    assert not module._env_flag_enabled(env_name, True)
+
+    monkeypatch.setenv(env_name, "false")
+    assert not module._env_flag_enabled(env_name, True)
+
+    monkeypatch.setenv(env_name, "1")
+    assert module._env_flag_enabled(env_name, True)

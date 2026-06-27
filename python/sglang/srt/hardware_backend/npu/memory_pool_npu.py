@@ -418,6 +418,114 @@ class NPUMiniMaxSparseKVPool(MiniMaxSparseKVPool):
             **kwargs,
         )
 
+    def _can_use_npu_fused_kv_index_store(
+        self,
+        index_pool,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        cache_idx_k: torch.Tensor,
+        cache_idx_v: Optional[torch.Tensor],
+    ) -> bool:
+        main = self.main_pool
+        return (
+            get_bool_env_var("SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE", "True")
+            and index_pool is not None
+            and cache_k.device.type == "npu"
+            and cache_v.device == cache_k.device
+            and cache_idx_k.device == cache_k.device
+            and (cache_idx_v is None or cache_idx_v.device == cache_k.device)
+            and main.store_dtype == main.dtype
+            and index_pool.store_dtype == index_pool.dtype
+            and cache_k.dtype == main.dtype
+            and cache_v.dtype == main.dtype
+            and cache_idx_k.dtype == index_pool.dtype
+            and (cache_idx_v is None or cache_idx_v.dtype == index_pool.dtype)
+            and main.dtype == index_pool.dtype
+            and main.head_dim == main.v_head_dim
+        )
+
+    @staticmethod
+    def _flatten_slot_cache(cache: torch.Tensor, head_num: int, head_dim: int):
+        return cache.view(-1, head_num, head_dim).flatten(1)
+
+    def set_fused_kv_index_buffer(
+        self,
+        layer: "RadixAttention",
+        loc,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        cache_idx_k: torch.Tensor,
+        cache_idx_v: Optional[torch.Tensor],
+    ) -> None:
+        disable_value = cache_idx_v is None
+        index_pool = self.index_k_pool if disable_value else self.index_kv_pool
+        if self._can_use_npu_fused_kv_index_store(
+            index_pool, cache_k, cache_v, cache_idx_k, cache_idx_v
+        ):
+            try:
+                from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.store_kv_index import (
+                    store_kv_index_npu_triton,
+                )
+
+                loc_tensor, _ = unwrap_write_loc(loc)
+                loc_tensor = loc_tensor.to(
+                    device=cache_k.device, dtype=torch.int32
+                ).contiguous()
+                main = self.main_pool
+                main_k = self._flatten_slot_cache(
+                    main.get_key_buffer(layer.layer_id), main.head_num, main.head_dim
+                )
+                main_v = self._flatten_slot_cache(
+                    main.get_value_buffer(layer.layer_id),
+                    main.head_num,
+                    main.v_head_dim,
+                )
+                maybe_detect_oob(
+                    loc_tensor, 0, main_k.shape[0], "NPU fused minimax kv/index store"
+                )
+                if disable_value:
+                    idx_k = self._flatten_slot_cache(
+                        self.get_index_k_buffer(layer.layer_id),
+                        index_pool.head_num,
+                        index_pool.head_dim,
+                    )
+                    idx_v = None
+                else:
+                    idx_k_buf, idx_v_buf = self.get_index_kv_buffer(layer.layer_id)
+                    idx_k = self._flatten_slot_cache(
+                        idx_k_buf, index_pool.head_num, index_pool.head_dim
+                    )
+                    idx_v = self._flatten_slot_cache(
+                        idx_v_buf, index_pool.head_num, index_pool.v_head_dim
+                    )
+                store_kv_index_npu_triton(
+                    cache_k.contiguous().flatten(1),
+                    cache_v.contiguous().flatten(1),
+                    main_k,
+                    main_v,
+                    cache_idx_k.contiguous().flatten(1),
+                    idx_k,
+                    None if disable_value else cache_idx_v.contiguous().flatten(1),
+                    idx_v,
+                    loc_tensor,
+                )
+                _minimax_npu_debug_sync(
+                    f"NPU fused minimax kv/index store layer_id={layer.layer_id}"
+                )
+                return
+            except Exception as exc:
+                if not getattr(self, "_npu_fused_store_warned", False):
+                    logger.warning(
+                        "NPU fused MiniMax KV/index store failed; falling back to "
+                        "separate stores: %s",
+                        exc,
+                    )
+                    self._npu_fused_store_warned = True
+
+        super().set_fused_kv_index_buffer(
+            layer, loc, cache_k, cache_v, cache_idx_k, cache_idx_v
+        )
+
     def get_index_k_state_buf_infos(self):
         pool = self.index_k_pool
         n = pool.layer_num

@@ -17,19 +17,27 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 
+def _env_flag_enabled(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
 def npu_swiglu_oai(x: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
     """MiniMax SwigluOAI activation for NPU MoE paths.
 
     ``(up + 1) * gate * sigmoid(gate * alpha)`` with gate/up clamped by ``limit``.
     ``x`` is the concatenated ``[gate | up]`` tensor (last dim = 2 * intermediate).
 
-    When ``SGLANG_NPU_FUSED_SWIGLU_OAI=1`` and the input lives on an NPU, a single
-    fused triton kernel (fp32 internal, bf16/fp16 out) replaces the ~6 separate
-    elementwise kernels of the reference path below. Default off; numerically
-    >= as accurate as the bf16 reference (verified by test_swiglu_oai_fused.py).
+    Unless ``SGLANG_MINIMAX_M3_NPU_FUSED_SWIGLU_OAI=0`` and the input lives on
+    an NPU, a single fused triton kernel (fp32 internal, bf16/fp16 out)
+    replaces the ~6 separate elementwise kernels of the reference path below.
+    Numerically >= as accurate as the bf16 reference.
     """
     if (
-        x.device.type == "npu"
+        _env_flag_enabled("SGLANG_MINIMAX_M3_NPU_FUSED_SWIGLU_OAI", True)
+        and x.device.type == "npu"
         and x.dtype in (torch.bfloat16, torch.float16)
         and x.numel() > 0
     ):

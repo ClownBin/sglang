@@ -48,6 +48,12 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
         self.assertIn("NPUMiniMaxSparseKVPool", class_names)
         self.assertIn("torch_npu.npu_scatter_nd_update_", source)
 
+    def test_npu_minimax_sparse_pool_has_fused_kv_index_store(self):
+        source = _read("python/sglang/srt/hardware_backend/npu/memory_pool_npu.py")
+
+        self.assertIn("def set_fused_kv_index_buffer", source)
+        self.assertIn("store_kv_index_npu_triton", source)
+
     def test_ascend_pool_selection_prefers_minimax_sparse_pool(self):
         source = _read("python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py")
         ascend_branch = source[
@@ -71,6 +77,35 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
         self.assertIn("_raise_npu_sparse_not_ready", source)
         self.assertRegex(source, r"self\.is_npu\s*=\s*is_npu\(\)")
 
+    def test_minimax_sparse_backend_caches_npu_triton_decode_metadata(self):
+        source = _read("python/sglang/srt/layers/attention/minimax_sparse_backend.py")
+
+        self.assertIn("_npu_triton_dec_meta", source)
+        self.assertIn("_prepare_npu_triton_decode_meta", source)
+        self.assertIn("merge_topk_index_for_sparse_decode", source)
+
+    def test_npu_sparse_decode_has_single_topk_chunk_direct_output(self):
+        source = _read(
+            "python/sglang/srt/layers/attention/minimax_sparse_ops/npu_triton/topk_sparse_decode.py"
+        )
+
+        self.assertIn("single_topk_chunk", source)
+        self.assertIn("num_topk_chunks == 1", source)
+
+    def test_minimax_m3_npu_swiglu_env_names_are_model_scoped(self):
+        source_paths = [
+            "python/sglang/srt/environ.py",
+            "python/sglang/srt/hardware_backend/npu/quantization/fused_moe_method_npu.py",
+            "python/sglang/srt/layers/triton_ops/npu_swiglu_oai_triton.py",
+            "test/manual/ascend/bench_minimax_swiglu_oai.py",
+        ]
+        combined = "\n".join(_read(path) for path in source_paths)
+
+        self.assertIn("SGLANG_MINIMAX_M3_NPU_FUSED_SWIGLU_OAI", combined)
+        self.assertNotIn("SGLANG_NPU_FUSED_SWIGLU_OAI", combined)
+        self.assertNotIn("SGLANG_NPU_SWIGLU_OAI_BLOCK_N", combined)
+        self.assertNotIn("SGLANG_NPU_SWIGLU_OAI_BLOCK_D", combined)
+
     def test_swigluoai_has_npu_eager_path(self):
         source = _read("python/sglang/srt/models/minimax_m3.py")
         tree = ast.parse(source)
@@ -79,10 +114,11 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
         }
 
         self.assertIn("_swigluoai_torch", function_names)
+        self.assertIn("npu_swiglu_oai", source)
         self.assertRegex(
             source,
-            r"(?s)elif hidden_act == \"swigluoai\".*?if _is_npu:",
-            "NPU must avoid the torch.compile/Triton swigluoai helper.",
+            r"(?s)elif hidden_act == \"swigluoai\".*?if _is_npu:.*?npu_swiglu_oai",
+            "NPU shared experts must use the common npu_swiglu_oai helper.",
         )
 
     def test_dense_mlp_accepts_decoder_layer_call_signature(self):

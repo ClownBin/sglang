@@ -41,7 +41,21 @@ def _install_fake_modules():
     common_index = sys.modules[
         "sglang.srt.layers.attention.minimax_sparse_ops.common.index"
     ]
-    common_index.topk_index_reduce = lambda tensor, dim: tensor
+    def topk_index_reduce(tensor, dim):
+        tensor_permuted = torch.movedim(tensor, source=dim, destination=-2)
+        combined = tensor_permuted.flatten(start_dim=-2)
+        sorted_vals, _ = combined.sort(dim=-1)
+        is_new_element = sorted_vals[..., 1:] != sorted_vals[..., :-1]
+        first_col_true = torch.ones_like(sorted_vals[..., :1], dtype=torch.bool)
+        non_duplicate_mask = torch.cat([first_col_true, is_new_element], dim=-1)
+        valid_mask = non_duplicate_mask & (sorted_vals != -1)
+        sort_idx = torch.argsort((~valid_mask).int(), dim=-1, stable=True)
+        result = torch.gather(sorted_vals, -1, sort_idx)
+        valid_count = valid_mask.sum(dim=-1, keepdim=True)
+        idx_range = torch.arange(result.size(-1), device=tensor.device)
+        return torch.where(idx_range < valid_count, result, -1)
+
+    common_index.topk_index_reduce = topk_index_reduce
 
     memory_pool = sys.modules["sglang.srt.mem_cache.memory_pool"]
     memory_pool.MiniMaxSparseKVPool = type("MiniMaxSparseKVPool", (), {})
@@ -74,6 +88,21 @@ def _load_minimax_sparse_backend_module():
     )
     spec = importlib.util.spec_from_file_location(
         "_minimax_sparse_backend_under_test", module_path
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_npu_index_merge_module():
+    _install_fake_modules()
+    module_path = (
+        Path(__file__).resolve().parents[2]
+        / "python/sglang/srt/layers/attention/minimax_sparse_ops/npu_triton/index_merge.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "_npu_index_merge_under_test", module_path
     )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -137,3 +166,98 @@ def test_npu_sparse_seq_matches_dense_attention_when_all_blocks_are_selected():
     expected = torch.einsum("qhk,khd->qhd", probs.to(v_seq.dtype), v_seq)
 
     torch.testing.assert_close(out.float(), expected.float(), rtol=1e-3, atol=1e-3)
+
+
+def test_npu_index_reduce_merge_matches_reference_for_msa_blocks():
+    backend_module = _load_minimax_sparse_backend_module()
+    index_merge = _load_npu_index_merge_module()
+    backend = backend_module.MiniMaxSparseAttnBackend.__new__(
+        backend_module.MiniMaxSparseAttnBackend
+    )
+    backend.block_size_k = 4
+    backend.topk_blocks = 2
+    backend.init_blocks = 1
+    backend.local_blocks = 1
+
+    topk_idx = torch.tensor(
+        [
+            [[2, 1], [3, -1]],
+            [[1, 4], [2, 3]],
+            [[0, 5], [1, 3]],
+            [[5, 2], [4, -1]],
+        ],
+        dtype=torch.int32,
+    )
+    num_kv_heads = 2
+    idx_group_size = topk_idx.shape[0] // num_kv_heads
+    query_positions = torch.tensor([9, 15], dtype=torch.long)
+    max_blocks = 4
+
+    reduced = backend_module.topk_index_reduce(
+        topk_idx.view(num_kv_heads, idx_group_size, 2, backend.topk_blocks),
+        dim=1,
+    )
+    reference = backend._merge_sparse_blocks(
+        reduced.permute(1, 0, 2).contiguous(), query_positions, max_blocks
+    ).permute(1, 0, 2).contiguous()
+
+    actual = index_merge.merge_topk_index_for_sparse_decode(
+        topk_idx,
+        query_positions,
+        num_kv_heads=num_kv_heads,
+        topk_blocks=backend.topk_blocks,
+        init_blocks=backend.init_blocks,
+        local_blocks=backend.local_blocks,
+        block_size=backend.block_size_k,
+        num_blocks=max_blocks,
+    )
+
+    torch.testing.assert_close(actual, reference)
+
+
+def test_npu_index_reduce_merge_preserves_local_fast_path_width():
+    backend_module = _load_minimax_sparse_backend_module()
+    index_merge = _load_npu_index_merge_module()
+    backend = backend_module.MiniMaxSparseAttnBackend.__new__(
+        backend_module.MiniMaxSparseAttnBackend
+    )
+    backend.block_size_k = 4
+    backend.topk_blocks = 2
+    backend.init_blocks = 0
+    backend.local_blocks = 1
+
+    topk_idx = torch.tensor(
+        [
+            [[2, 1]],
+            [[1, 4]],
+            [[0, 5]],
+            [[5, 2]],
+        ],
+        dtype=torch.int32,
+    )
+    num_kv_heads = 2
+    idx_group_size = topk_idx.shape[0] // num_kv_heads
+    query_positions = torch.tensor([9], dtype=torch.long)
+    max_blocks = 4
+
+    reduced = backend_module.topk_index_reduce(
+        topk_idx.view(num_kv_heads, idx_group_size, 1, backend.topk_blocks),
+        dim=1,
+    )
+    reference = backend._merge_sparse_blocks(
+        reduced.permute(1, 0, 2).contiguous(), query_positions, max_blocks
+    ).permute(1, 0, 2).contiguous()
+
+    actual = index_merge.merge_topk_index_for_sparse_decode(
+        topk_idx,
+        query_positions,
+        num_kv_heads=num_kv_heads,
+        topk_blocks=backend.topk_blocks,
+        init_blocks=backend.init_blocks,
+        local_blocks=backend.local_blocks,
+        block_size=backend.block_size_k,
+        num_blocks=max_blocks,
+    )
+
+    assert actual.shape[-1] == idx_group_size * backend.topk_blocks + 1
+    torch.testing.assert_close(actual, reference)

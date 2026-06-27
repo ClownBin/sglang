@@ -499,11 +499,16 @@ def flash_decode_bnsd_with_gqa_share_sparse(
     # This keeps correctness unchanged while avoiding the backend corner case.
     chunk_size_topk = max(2, chunk_size_topk)
 
-    o_partial = torch.empty(
-        (num_topk_chunks, batch_size, num_q_heads, head_dim),
-        dtype=q.dtype,
-        device=q.device,
-    )
+    single_topk_chunk = num_topk_chunks == 1
+    if single_topk_chunk:
+        out = torch.empty_like(q)
+        o_partial = out.unsqueeze(0)
+    else:
+        o_partial = torch.empty(
+            (num_topk_chunks, batch_size, num_q_heads, head_dim),
+            dtype=q.dtype,
+            device=q.device,
+        )
     lse_partial = torch.empty(
         (num_topk_chunks, batch_size, num_q_heads),
         dtype=torch.float32,
@@ -565,6 +570,9 @@ def flash_decode_bnsd_with_gqa_share_sparse(
         num_warps=4,
         num_stages=2,
     )
+
+    if single_topk_chunk:
+        return out
 
     out = torch.empty_like(q)
 

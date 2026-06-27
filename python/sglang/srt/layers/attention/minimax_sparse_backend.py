@@ -117,6 +117,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # Per-forward MSA decode metadata (page table + fmha plan), shared by every
         # sparse layer of a forward; (re)built in init_forward_metadata_out_graph.
         self._msa_dec_meta = None
+        # Per-forward NPU Triton decode metadata, shared by every sparse layer.
+        self._npu_triton_dec_meta = None
         if self.use_msa:
             from sglang.srt.layers.dp_attention import get_attention_tp_size
 
@@ -206,6 +208,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # and TARGET_VERIFY sets it to None despite is_extend() — getattr covers both.
         # New forward -> invalidate the cached per-forward MSA decode metadata.
         self._msa_dec_meta = None
+        self._npu_triton_dec_meta = None
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if extend_lens is not None:
             self._max_seqlen_q = int(max(extend_lens))
@@ -222,6 +225,38 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # captured graph reads. Skipped when the dense-sparse-decode path owns decode.
         if self._msa_owns_decode and forward_batch.forward_mode.is_decode_or_idle():
             self._prepare_msa_decode_meta(forward_batch)
+        if (
+            self.is_npu
+            and _npu_use_triton_sparse()
+            and forward_batch.forward_mode.is_decode_or_idle()
+        ):
+            self._prepare_npu_triton_decode_meta(forward_batch)
+
+    def _build_npu_triton_decode_meta(self, forward_batch: ForwardBatch):
+        seq_lens = forward_batch.seq_lens.to(torch.int32)
+        max_seqlen = (
+            int(self._max_seqlen_k)
+            if self._max_seqlen_k
+            else int(seq_lens.max().item())
+        )
+        max_blocks = (max_seqlen + self.page_size - 1) // self.page_size
+        req_idx = forward_batch.req_pool_indices.long()
+        max_cols = self.req_to_token.shape[1]
+        blk_cols = (
+            torch.arange(max_blocks, device=seq_lens.device, dtype=torch.long)
+            * self.page_size
+        )
+        blk_cols = blk_cols.clamp(max=max_cols - 1)
+        token_slots = self.req_to_token[req_idx][:, blk_cols]
+        block_table = (token_slots // self.page_size).to(torch.int32)
+        query_positions = (seq_lens.to(torch.long) - 1).clamp(min=0)
+        return seq_lens, max_seqlen, max_blocks, block_table, query_positions
+
+    def _prepare_npu_triton_decode_meta(self, forward_batch: ForwardBatch):
+        """Build per-forward NPU Triton decode metadata once for all sparse layers."""
+        if forward_batch.seq_lens.shape[0] == 0:
+            return
+        self._npu_triton_dec_meta = self._build_npu_triton_decode_meta(forward_batch)
 
     def _prepare_msa_decode_meta(self, forward_batch: ForwardBatch):
         """Refresh the persistent per-batch-size MSA decode plan + page table in place."""
@@ -759,6 +794,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.flash_block_score_decode import (
             flash_decode_bnsd_with_topk_idx,
         )
+        from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.index_merge import (
+            merge_topk_index_for_sparse_decode,
+        )
         from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.topk_sparse_decode import (
             flash_decode_bnsd_with_gqa_share_sparse,
         )
@@ -808,21 +846,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             )
 
         # block_table[b, blk] = page holding logical block blk of request b.
-        seq_lens = forward_batch.seq_lens.to(torch.int32)
-        max_seqlen = (
-            int(self._max_seqlen_k)
-            if self._max_seqlen_k
-            else int(seq_lens.max().item())
-        )
-        max_blocks = (max_seqlen + page_size - 1) // page_size
-        req_idx = forward_batch.req_pool_indices.long()
-        max_cols = self.req_to_token.shape[1]
-        blk_cols = (
-            torch.arange(max_blocks, device=q.device, dtype=torch.long) * page_size
-        )
-        blk_cols = blk_cols.clamp(max=max_cols - 1)
-        token_slots = self.req_to_token[req_idx][:, blk_cols]  # [B, max_blocks]
-        block_table = (token_slots // page_size).to(torch.int32)
+        meta = getattr(self, "_npu_triton_dec_meta", None)
+        if meta is None or meta[0].shape[0] != q.shape[0] or meta[3].device != q.device:
+            meta = self._build_npu_triton_decode_meta(forward_batch)
+        seq_lens, max_seqlen, max_blocks, block_table, query_positions = meta
 
         disable_index_value = idx_v_cache is None
 
@@ -855,26 +882,24 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             disable_index_value=disable_index_value,
         )
 
-        # 2) reduce index heads -> kv heads (no-op when num_idx_heads == num_kv_heads)
-        if num_idx_heads > num_kv_heads:
-            idx_group_size = num_idx_heads // num_kv_heads
-            topk_idx = topk_index_reduce(
-                topk_idx.view(num_kv_heads, idx_group_size, -1, self.topk_blocks),
-                dim=1,
-            )
-
-        # 3) Append the forced init/local blocks on top of the pure top-k, using the
+        # 2) Reduce index heads and append the forced init/local blocks on top of
+        # the pure top-k, using the
         # SAME concat+dedup semantics as the pure-PyTorch path (_merge_sparse_blocks)
         # so triton decode attends to the identical block set. `max_blocks` (batch
         # max) is a safe upper bound here: the indexer already emitted only valid,
         # causal block ids per request, and _merge_sparse_blocks only uses num_blocks
         # for clamping/validity masking. The main sparse kernel accepts the wider
         # topk_idx (max_topk = topk+init+local) and skips the -1 dedup sentinels.
-        topk_2d = topk_idx.permute(1, 0, 2).contiguous()  # [B, num_kv_heads, topk]
-        # Decode: each query sits at the last token of its sequence.
-        query_positions = (seq_lens.to(torch.long) - 1).clamp(min=0)
-        topk_merged = self._merge_sparse_blocks(topk_2d, query_positions, max_blocks)
-        topk_idx = topk_merged.permute(1, 0, 2).contiguous()  # [num_kv_heads, B, topk+init+local]
+        topk_idx = merge_topk_index_for_sparse_decode(
+            topk_idx,
+            query_positions,
+            num_kv_heads=num_kv_heads,
+            topk_blocks=self.topk_blocks,
+            init_blocks=self.init_blocks,
+            local_blocks=self.local_blocks,
+            block_size=page_size,
+            num_blocks=max_blocks,
+        )
 
         # 4) main sparse attention over the selected blocks
         o = flash_decode_bnsd_with_gqa_share_sparse(

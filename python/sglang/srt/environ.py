@@ -881,6 +881,9 @@ class Envs:
     # MiniMax-M3 MXFP8 MoE: experimental fusion toggles (default off; A/B only).
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
+    # MiniMax-M3 NPU SwiGLU-OAI: keep the fused Triton activation on by default,
+    # but allow profiling and emergency fallback to the torch reference path.
+    SGLANG_MINIMAX_M3_NPU_FUSED_SWIGLU_OAI = EnvBool(True)
 
     # GEMM / kernel fusion
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)

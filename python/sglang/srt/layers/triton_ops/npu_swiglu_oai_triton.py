@@ -20,12 +20,61 @@ primitives as ``minimax_sparse_ops/npu_triton/flash_block_score_decode.py``).
 """
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
 
 # log2(e); used to express exp() through the TBE-verified tl.exp2().
 _LOG2E = 1.4426950408889634
+
+
+def _next_power_of_2(x: int) -> int:
+    return 1 << (max(1, int(x)) - 1).bit_length()
+
+
+def _get_positive_int_env(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _choose_swiglu_oai_tile(n_rows: int, d: int) -> tuple[int, int]:
+    """Choose an Ascend-friendly tile for decode and prefill shapes.
+
+    Decode typically has very few rows and a large intermediate dimension, so a
+    wider D tile reduces the number of programs. Prefill has many rows, where
+    the original conservative 8x256 tile keeps register pressure predictable.
+    Env overrides are intentionally simple for profiling A/B:
+    ``SGLANG_MINIMAX_M3_NPU_SWIGLU_OAI_BLOCK_N`` and
+    ``SGLANG_MINIMAX_M3_NPU_SWIGLU_OAI_BLOCK_D``.
+    """
+    if n_rows <= 4:
+        block_n, target_d = 1, 1024
+    elif n_rows <= 16:
+        block_n, target_d = 4, 512
+    else:
+        block_n, target_d = 8, 256
+
+    block_d = _next_power_of_2(min(max(1, d), target_d))
+    block_d = min(block_d, 4096)
+
+    block_n = (
+        _get_positive_int_env("SGLANG_MINIMAX_M3_NPU_SWIGLU_OAI_BLOCK_N")
+        or block_n
+    )
+    block_d_override = _get_positive_int_env(
+        "SGLANG_MINIMAX_M3_NPU_SWIGLU_OAI_BLOCK_D"
+    )
+    if block_d_override is not None:
+        block_d = min(_next_power_of_2(block_d_override), 4096)
+    return block_n, block_d
 
 
 @triton.jit
@@ -85,10 +134,7 @@ def npu_swiglu_oai_fused(
 
     out = torch.empty((n_rows, d), device=x.device, dtype=x.dtype)
 
-    # Tile heuristics: keep BLOCK_D a power of two; cap so huge d still tiles.
-    BLOCK_D = 256 if d >= 256 else (1 << (d - 1).bit_length())
-    BLOCK_D = min(BLOCK_D, 4096)
-    BLOCK_N = 8
+    BLOCK_N, BLOCK_D = _choose_swiglu_oai_tile(n_rows, d)
 
     grid = (triton.cdiv(n_rows, BLOCK_N), triton.cdiv(d, BLOCK_D))
     _swiglu_oai_kernel[grid](

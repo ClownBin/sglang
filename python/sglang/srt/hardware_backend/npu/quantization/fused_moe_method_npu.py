@@ -30,13 +30,13 @@ def npu_swiglu_oai(x: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
     ``(up + 1) * gate * sigmoid(gate * alpha)`` with gate/up clamped by ``limit``.
     ``x`` is the concatenated ``[gate | up]`` tensor (last dim = 2 * intermediate).
 
-    Unless ``SGLANG_MINIMAX_M3_NPU_FUSED_SWIGLU_OAI=0`` and the input lives on
-    an NPU, a single fused triton kernel (fp32 internal, bf16/fp16 out)
-    replaces the ~6 separate elementwise kernels of the reference path below.
-    Numerically >= as accurate as the bf16 reference.
+    When ``SGLANG_MINIMAX_M3_NPU_FUSED_SWIGLU_OAI=1`` and the input lives on
+    an NPU, a single fused Triton kernel (fp32 internal, bf16/fp16 out)
+    replaces the reference path below. The fused path is opt-in until it is
+    validated on real serving workloads.
     """
     if (
-        _env_flag_enabled("SGLANG_MINIMAX_M3_NPU_FUSED_SWIGLU_OAI", True)
+        _env_flag_enabled("SGLANG_MINIMAX_M3_NPU_FUSED_SWIGLU_OAI", False)
         and x.device.type == "npu"
         and x.dtype in (torch.bfloat16, torch.float16)
         and x.numel() > 0

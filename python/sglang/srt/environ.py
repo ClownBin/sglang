@@ -881,9 +881,15 @@ class Envs:
     # MiniMax-M3 MXFP8 MoE: experimental fusion toggles (default off; A/B only).
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
-    # MiniMax-M3 NPU SwiGLU-OAI: keep the fused Triton activation on by default,
-    # but allow profiling and emergency fallback to the torch reference path.
-    SGLANG_MINIMAX_M3_NPU_FUSED_SWIGLU_OAI = EnvBool(True)
+    # MiniMax-M3 NPU SwiGLU-OAI: experimental fused Triton activation.
+    # Keep this opt-in until real serving workloads validate it; the torch
+    # reference path remains the default.
+    SGLANG_MINIMAX_M3_NPU_FUSED_SWIGLU_OAI = EnvBool(False)
+    # MiniMax-M3 NPU sparse attention: experimental fused main K/V + index K/V
+    # cache store. Keep this opt-in until it is validated on real Ascend serving
+    # workloads; the CUDA JIT store above remains controlled by
+    # SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE.
+    SGLANG_MINIMAX_M3_NPU_FUSED_KV_INDEX_STORE = EnvBool(False)
 
     # GEMM / kernel fusion
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)

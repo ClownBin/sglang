@@ -429,6 +429,7 @@ class NPUMiniMaxSparseKVPool(MiniMaxSparseKVPool):
         main = self.main_pool
         return (
             get_bool_env_var("SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE", "True")
+            and get_bool_env_var("SGLANG_MINIMAX_M3_NPU_FUSED_KV_INDEX_STORE", "False")
             and index_pool is not None
             and cache_k.device.type == "npu"
             and cache_v.device == cache_k.device
@@ -471,6 +472,12 @@ class NPUMiniMaxSparseKVPool(MiniMaxSparseKVPool):
                 loc_tensor = loc_tensor.to(
                     device=cache_k.device, dtype=torch.int32
                 ).contiguous()
+                if loc_tensor.numel() < cache_k.shape[0]:
+                    raise ValueError(
+                        "loc length must cover every token for NPU fused "
+                        f"MiniMax KV/index store: loc={loc_tensor.numel()} "
+                        f"tokens={cache_k.shape[0]}"
+                    )
                 main = self.main_pool
                 main_k = self._flatten_slot_cache(
                     main.get_key_buffer(layer.layer_id), main.head_num, main.head_dim

@@ -954,6 +954,22 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         layer_ids = forward_batch.minimax_m3_precached_sparse_layers
         return layer_ids is not None and layer_id in layer_ids
 
+    def _store_sparse_kv_index_separate(
+        self,
+        layer,
+        loc: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        idx_k: torch.Tensor,
+        idx_v: Optional[torch.Tensor],
+        disable_value: bool,
+    ) -> None:
+        self.kv_pool.set_kv_buffer(layer, loc, k, v)
+        if disable_value:
+            self.kv_pool.set_index_k_buffer(layer, loc, idx_k)
+        else:
+            self.kv_pool.set_index_kv_buffer(layer, loc, idx_k, idx_v)
+
     def forward(
         self,
         q,
@@ -998,14 +1014,25 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             forward_batch, layer.layer_id
         )
         if not kv_cached_by_fusion:
-            self.kv_pool.set_fused_kv_index_buffer(
-                layer,
-                forward_batch.out_cache_loc,
-                k,
-                v,
-                idx_k,
-                None if disable_value else idx_v,
-            )
+            if self.is_npu:
+                self._store_sparse_kv_index_separate(
+                    layer,
+                    forward_batch.out_cache_loc,
+                    k,
+                    v,
+                    idx_k,
+                    idx_v,
+                    disable_value,
+                )
+            else:
+                self.kv_pool.set_fused_kv_index_buffer(
+                    layer,
+                    forward_batch.out_cache_loc,
+                    k,
+                    v,
+                    idx_k,
+                    None if disable_value else idx_v,
+                )
         k_cache, v_cache = self.kv_pool.get_kv_buffer(layer.layer_id)
         if disable_value:
             idx_k_cache = self.kv_pool.get_index_k_buffer(layer.layer_id)

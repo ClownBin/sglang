@@ -67,13 +67,13 @@ def test_npu_swiglu_oai_env_flag_parser(monkeypatch):
 
     env_name = "SGLANG_MINIMAX_M3_NPU_FUSED_SWIGLU_OAI"
     monkeypatch.delenv(env_name, raising=False)
-    assert module._env_flag_enabled(env_name, True)
+    assert not module._env_flag_enabled(env_name, False)
 
     monkeypatch.setenv(env_name, "0")
-    assert not module._env_flag_enabled(env_name, True)
+    assert not module._env_flag_enabled(env_name, False)
 
     monkeypatch.setenv(env_name, "false")
-    assert not module._env_flag_enabled(env_name, True)
+    assert not module._env_flag_enabled(env_name, False)
 
     monkeypatch.setenv(env_name, "1")
-    assert module._env_flag_enabled(env_name, True)
+    assert module._env_flag_enabled(env_name, False)

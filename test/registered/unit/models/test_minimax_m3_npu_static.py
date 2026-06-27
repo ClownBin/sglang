@@ -18,6 +18,16 @@ def _read(path: str) -> str:
     return (REPO_ROOT / path).read_text()
 
 
+def _class_functions(source: str, class_name: str):
+    tree = ast.parse(source)
+    cls = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    return {node.name: node for node in cls.body if isinstance(node, ast.FunctionDef)}
+
+
 class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
     def test_model_has_explicit_npu_prepare_path(self):
         source = _read("python/sglang/srt/models/minimax_m3.py")
@@ -53,6 +63,21 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
 
         self.assertIn("def set_fused_kv_index_buffer", source)
         self.assertIn("store_kv_index_npu_triton", source)
+        self.assertIn("SGLANG_MINIMAX_M3_NPU_FUSED_KV_INDEX_STORE", source)
+        self.assertIn('"False"', source)
+
+    def test_minimax_m3_npu_fused_kv_index_store_env_is_opt_in(self):
+        environ_source = _read("python/sglang/srt/environ.py")
+        pool_source = _read("python/sglang/srt/hardware_backend/npu/memory_pool_npu.py")
+
+        self.assertIn(
+            "SGLANG_MINIMAX_M3_NPU_FUSED_KV_INDEX_STORE = EnvBool(False)",
+            environ_source,
+        )
+        self.assertIn(
+            'get_bool_env_var("SGLANG_MINIMAX_M3_NPU_FUSED_KV_INDEX_STORE", "False")',
+            pool_source,
+        )
 
     def test_ascend_pool_selection_prefers_minimax_sparse_pool(self):
         source = _read("python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py")
@@ -84,6 +109,57 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
         self.assertIn("_prepare_npu_triton_decode_meta", source)
         self.assertIn("merge_topk_index_for_sparse_decode", source)
 
+    def test_npu_triton_sparse_path_is_npu_decode_only(self):
+        source = _read("python/sglang/srt/layers/attention/minimax_sparse_backend.py")
+        tree = ast.parse(source)
+        module_functions = {
+            node.name: node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+        functions = _class_functions(source, "MiniMaxSparseAttnBackend")
+
+        use_triton_source = ast.get_source_segment(
+            source, module_functions["_npu_use_triton_sparse"]
+        )
+        init_meta_source = ast.get_source_segment(
+            source, functions["init_forward_metadata_out_graph"]
+        )
+        forward_extend_source = ast.get_source_segment(
+            source, functions["forward_extend"]
+        )
+        forward_decode_source = ast.get_source_segment(
+            source, functions["forward_decode"]
+        )
+        triton_decode_source = ast.get_source_segment(
+            source, functions["_forward_npu_triton_decode"]
+        )
+
+        self.assertIn("return is_npu() and", use_triton_source)
+        self.assertIn("SGLANG_MINIMAX_NPU_TRITON", use_triton_source)
+        self.assertIn("forward_batch.forward_mode.is_decode_or_idle()", init_meta_source)
+        self.assertIn("_npu_use_triton_sparse()", forward_decode_source)
+        self.assertIn("_forward_npu_triton_decode", forward_decode_source)
+        self.assertNotIn("_npu_use_triton_sparse()", forward_extend_source)
+        self.assertNotIn("_forward_npu_triton_decode", forward_extend_source)
+        self.assertNotIn("minimax_sparse_ops.npu_triton", forward_extend_source)
+        self.assertIn("minimax_sparse_ops.npu_triton", triton_decode_source)
+        self.assertNotIn("sglang.jit_kernel", triton_decode_source)
+        self.assertNotIn("minimax_sparse_ops.decode", triton_decode_source)
+        self.assertNotIn("minimax_sparse_ops.prefill", triton_decode_source)
+
+    def test_npu_prefill_uses_separate_kv_index_store(self):
+        source = _read("python/sglang/srt/layers/attention/minimax_sparse_backend.py")
+        functions = _class_functions(source, "MiniMaxSparseAttnBackend")
+        forward_extend_source = ast.get_source_segment(
+            source, functions["forward_extend"]
+        )
+
+        self.assertIn("_store_sparse_kv_index_separate", source)
+        self.assertIn("if self.is_npu:", forward_extend_source)
+        self.assertIn("_store_sparse_kv_index_separate", forward_extend_source)
+        self.assertIn("set_fused_kv_index_buffer", forward_extend_source)
+
     def test_npu_sparse_decode_has_single_topk_chunk_direct_output(self):
         source = _read(
             "python/sglang/srt/layers/attention/minimax_sparse_ops/npu_triton/topk_sparse_decode.py"
@@ -105,6 +181,21 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
         self.assertNotIn("SGLANG_NPU_FUSED_SWIGLU_OAI", combined)
         self.assertNotIn("SGLANG_NPU_SWIGLU_OAI_BLOCK_N", combined)
         self.assertNotIn("SGLANG_NPU_SWIGLU_OAI_BLOCK_D", combined)
+
+    def test_minimax_m3_npu_fused_swiglu_oai_is_opt_in(self):
+        environ_source = _read("python/sglang/srt/environ.py")
+        helper_source = _read(
+            "python/sglang/srt/hardware_backend/npu/quantization/fused_moe_method_npu.py"
+        )
+
+        self.assertIn(
+            "SGLANG_MINIMAX_M3_NPU_FUSED_SWIGLU_OAI = EnvBool(False)",
+            environ_source,
+        )
+        self.assertIn(
+            '_env_flag_enabled("SGLANG_MINIMAX_M3_NPU_FUSED_SWIGLU_OAI", False)',
+            helper_source,
+        )
 
     def test_swigluoai_has_npu_eager_path(self):
         source = _read("python/sglang/srt/models/minimax_m3.py")

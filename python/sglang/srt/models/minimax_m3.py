@@ -45,6 +45,7 @@ from sglang.srt.layers.communicator import (
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
+    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
@@ -91,6 +92,7 @@ from sglang.srt.utils import (
     get_device_sm,
     is_cuda,
     is_hip,
+    is_npu,
     log_info_on_rank0,
     make_layers,
 )
@@ -98,6 +100,7 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_npu = is_npu()
 _device_sm = get_device_sm()
 
 # fp8 main-K/V cache dtypes (index cache always stays bf16). When the sparse
@@ -125,6 +128,9 @@ if _is_hip:
         _has_rocm_qk_norm_rope = True
     except ImportError:
         _has_rocm_qk_norm_rope = False
+
+if _is_npu:
+    from sgl_kernel_npu.norm.split_qkv_tp_rmsnorm_rope import split_qkv_tp_rmsnorm_rope
 
 logger = logging.getLogger(__name__)
 
@@ -243,6 +249,25 @@ def build_minimax_fused_qkv_index(model: nn.Module) -> None:
 
 
 class MiniMaxM3MLP(nn.Module):
+    @staticmethod
+    def _swigluoai_torch(
+        x: torch.Tensor, gemm1_alpha: float, gemm1_limit: float
+    ) -> torch.Tensor:
+        gate, up = x.chunk(2, dim=-1)
+        gate = gate.clamp(min=None, max=gemm1_limit)
+        up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
+        return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
+
+    @staticmethod
+    def _swigluoai_fused(
+        x: torch.Tensor, alpha: float, limit: float
+    ) -> torch.Tensor:
+        """swiglu_oai using fused Triton kernel (sgl_kernel_npu), no quant."""
+        from sglang.srt.layers.triton_ops.npu_swiglu_oai_quant import swiglu_oai_quant
+
+        out, _ = swiglu_oai_quant(x, alpha, limit, need_quant=False)
+        return out
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -279,13 +304,18 @@ class MiniMaxM3MLP(nn.Module):
         if hidden_act == "silu":
             self.act_fn = SiluAndMul()
         elif hidden_act == "swigluoai":
-            from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
-                swiglu_no_interleaved_with_alpha_and_limit,
-            )
+            if _is_npu:
+                self.act_fn = lambda x: self._swigluoai_fused(
+                    x, config.swiglu_alpha, config.swiglu_limit
+                )
+            else:
+                from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+                    swiglu_no_interleaved_with_alpha_and_limit,
+                )
 
-            self.act_fn = lambda x: swiglu_no_interleaved_with_alpha_and_limit(
-                x, config.swiglu_alpha, config.swiglu_limit
-            )
+                self.act_fn = lambda x: swiglu_no_interleaved_with_alpha_and_limit(
+                    x, config.swiglu_alpha, config.swiglu_limit
+                )
         else:
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
@@ -294,6 +324,7 @@ class MiniMaxM3MLP(nn.Module):
     def forward(
         self,
         x,
+        forward_batch: Optional[ForwardBatch] = None,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ):
@@ -357,7 +388,7 @@ class MiniMaxM3MoE(nn.Module):
             gemm1_alpha=config.swiglu_alpha,
             gemm1_clamp_limit=config.swiglu_limit,
             prefix=add_prefix("experts", prefix),
-            interleaved=False,
+            gate_up_interleaved=False,
         )
         # use sigmoid_topk, instead of grouped_topk
         self.topk = TopK(
@@ -475,7 +506,7 @@ class MiniMaxM3MoE(nn.Module):
         return final_hidden_states
 
     def _compute_router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.bf16_router_gemm:
+        if self.bf16_router_gemm and not _is_npu:
             return torch.mm(
                 hidden_states, self.gate.weight.t(), out_dtype=torch.float32
             )
@@ -664,10 +695,14 @@ class MiniMaxM3Attention(nn.Module):
         if self.qk_norm_type == "per_layer":
             if attn_tp_size > 1:
                 self.q_norm = MiniMaxM2RMSNormTP(
-                    self.total_num_heads * self.head_dim, eps=config.rms_norm_eps
+                    self.total_num_heads * self.head_dim,
+                    num_heads=self.total_num_heads,
+                    eps=config.rms_norm_eps,
                 )
                 self.k_norm = MiniMaxM2RMSNormTP(
-                    self.total_num_kv_heads * self.head_dim, eps=config.rms_norm_eps
+                    self.total_num_kv_heads * self.head_dim,
+                    num_heads=self.total_num_kv_heads,
+                    eps=config.rms_norm_eps,
                 )
             else:
                 self.q_norm = RMSNorm(
@@ -939,6 +974,11 @@ class MiniMaxM3Attention(nn.Module):
         if type(ip.quant_method) is not type(qm):
             return
 
+        # gfx942 converts MXFP8->block-fp8 in process_weights_after_loading; the
+        # fused module skips that pass, so keep two separate (converted) GEMMs.
+        if getattr(qm, "convert_mxfp8_to_block", False):
+            return
+
         weight = torch.cat([qp.weight.data, ip.weight.data], dim=0).contiguous()
         if isinstance(qm, UnquantizedLinearMethod):
             scale = None
@@ -1114,6 +1154,50 @@ class MiniMaxM3Attention(nn.Module):
             return q, k, idx_q, idx_k
         return self._sparse_qk_index_norm_rope(positions, q, k, idx_q, idx_k)
 
+    def _can_use_npu_split_qkv_tp_rmsnorm_rope(self) -> bool:
+        return (
+            _is_npu
+            and not self.is_sparse_attention_layer
+            and self.use_qk_norm
+            and self.qk_norm_type == "per_layer"
+            and not self.attention_output_gate
+        )
+
+    def forward_prepare_npu(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        if hidden_states.shape[0] == 0:
+            assert (
+                not self.o_proj.reduce_results
+            ), "short-circuiting allreduce will lead to hangs"
+            return hidden_states, forward_batch, None
+
+        if not self._can_use_npu_split_qkv_tp_rmsnorm_rope():
+            return self.forward_prepare(positions, hidden_states, forward_batch)
+
+        qkv, _ = self.qkv_proj(hidden_states)
+        cos_sin = self.rotary_emb.cos_sin_cache.index_select(0, positions.flatten())
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        q, k, v = split_qkv_tp_rmsnorm_rope(
+            input=qkv,
+            cos=cos,
+            sin=sin,
+            q_weight=self.q_norm.weight,
+            k_weight=self.k_norm.weight,
+            q_hidden_size=self.q_size,
+            kv_hidden_size=self.kv_size,
+            head_dim=self.head_dim,
+            rotary_dim=self.rotary_dim,
+            eps=self.q_norm.variance_epsilon,
+            tp_world=getattr(self.q_norm, "attn_tp_size", self.attn_tp_size),
+            tp_group=get_attention_tp_group().device_group,
+        )
+        inner_state = (q, k, v, None, forward_batch)
+        return None, forward_batch, inner_state
+
     def forward_prepare(
         self,
         positions: torch.Tensor,
@@ -1272,11 +1356,18 @@ class MiniMaxM3Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        s = self.forward_prepare(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-        )
+        if _is_npu:
+            s = self.forward_prepare_npu(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+        else:
+            s = self.forward_prepare(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
         return self.forward_core(s)
 
 
@@ -1433,15 +1524,11 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 forward_batch
             )
         )
-        if (
-            _is_hip
-            and self.is_layer_sparse
-            and get_moe_a2a_backend().is_none()
-            and get_moe_expert_parallel_world_size() > 1
-        ):
-            # Standard EP computes partial expert outputs on each rank and
-            # needs the normal immediate all-reduce in MiniMaxM3MoE.forward_normal.
-            # The deferred AITER all-reduce fusion corrupts those sparse partials.
+        if self.is_layer_sparse and get_tensor_model_parallel_world_size() > 1:
+            # Sparse MoE produces partial expert outputs per rank; deferring the
+            # all-reduce into the next layer's fusion corrupts those partials and
+            # re-triggers the M3 no-EOS runaway. Force the immediate all-reduce in
+            # MiniMaxM3MoE.forward_normal (aligns with vLLM). Dense MLP keeps fusion.
             should_allreduce_fusion = False
 
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
@@ -1451,9 +1538,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
         if self.is_layer_sparse or hidden_states.shape[0] != 0:
             hidden_states = self.mlp(
                 hidden_states,
-                forward_batch,
-                should_allreduce_fusion,
-                use_reduce_scatter,
+                forward_batch=forward_batch,
+                should_allreduce_fusion=should_allreduce_fusion,
+                use_reduce_scatter=use_reduce_scatter,
             )
 
         if should_allreduce_fusion:

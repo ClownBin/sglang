@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
@@ -68,6 +69,15 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 logger = logging.getLogger(__name__)
 
 
+def _is_mnnvl_fabric_supported() -> bool:
+    if not is_flashinfer_available():
+        return False
+
+    from flashinfer.comm.mnnvl import is_mnnvl_fabric_supported
+
+    return is_mnnvl_fabric_supported(torch.cuda.current_device())
+
+
 def _deepep_precompile_tp_barrier() -> None:
     # DeepEP's all-to-all operation has a much shorter timeout compared to torch.distributed,
     # so if different ranks compile at different speeds, it may quickly trigger a timeout.
@@ -75,6 +85,40 @@ def _deepep_precompile_tp_barrier() -> None:
     # We apply this barrier only in the compile stage to prevent extra all-reduce overhead at runtime.
     if envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get():
         get_tp_group().barrier()
+
+
+def _prepare_low_latency_dispatch_inputs(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_max_dispatch_tokens_per_rank: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_tokens = hidden_states.shape[0]
+    if num_max_dispatch_tokens_per_rank <= 0:
+        raise RuntimeError(
+            "DeepEP low_latency dispatch requires a positive "
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK, got "
+            f"{num_max_dispatch_tokens_per_rank}."
+        )
+    if num_tokens > num_max_dispatch_tokens_per_rank:
+        raise RuntimeError(
+            "DeepEP low_latency dispatch input exceeds the preallocated token "
+            "buffer: hidden_states.shape[0]="
+            f"{num_tokens}, SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
+            f"{num_max_dispatch_tokens_per_rank}. Increase "
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK or reduce decode "
+            "concurrency/speculative tokens."
+        )
+
+    if _is_npu:
+        os.environ.setdefault("MOE_ENABLE_TOPK_NEG_ONE", "1")
+
+    hidden_states = hidden_states.contiguous()
+    topk_weights = topk_weights.contiguous()
+    topk_dtype = torch.int32 if _is_npu else torch.int64
+    topk_ids = topk_ids.to(topk_dtype).contiguous()
+
+    return hidden_states, topk_ids, topk_weights
 
 
 class DeepEPPDispatchHooks(DispatcherBaseHooks):
@@ -234,11 +278,11 @@ class DeepEPBuffer:
                     f"Consider using --deepep-config to change the behavior."
                 )
 
+        use_mnnvl_fabric = _is_mnnvl_fabric_supported()
         buffer_kwargs = dict(
             low_latency_mode=deepep_mode.enable_low_latency(),
             num_qps_per_rank=num_qps_per_rank,
-            # TODO can be false when unneeded
-            allow_mnnvl=True,
+            allow_mnnvl=use_mnnvl_fabric,
         )
         # Use CU_MEM_HANDLE_TYPE_FABRIC on hardware that advertises MNNVL fabric
         # support, so cross-pod GB200/GB300 EP groups use
@@ -251,11 +295,8 @@ class DeepEPBuffer:
         #            auto-enables fabric in C++ when supported, so we skip it:
         #            https://github.com/fzyzcjy/DeepEP/blob/814e508537c6ffc775d59f6f1b9ba43f3a65968c/csrc/deep_ep.cpp#L52
         is_cu12 = get_cuda_version()[0] == 12
-        if not is_cu12 and is_flashinfer_available():
-            from flashinfer.comm.mnnvl import is_mnnvl_fabric_supported
-
-            if is_mnnvl_fabric_supported(torch.cuda.current_device()):
-                buffer_kwargs["use_fabric"] = True
+        if not is_cu12 and use_mnnvl_fabric:
+            buffer_kwargs["use_fabric"] = True
 
         cls._buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
         return cls._buffer
@@ -646,12 +687,17 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-        topk_ids = topk_ids.to(torch.int64)
+        hidden_states, topk_ids, topk_weights = _prepare_low_latency_dispatch_inputs(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            self.num_max_dispatch_tokens_per_rank,
+        )
         expected_m = (
             hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
             + self.num_experts
         ) // self.num_experts
-        hidden_states, masked_m, event, hook = self._dispatch_core(
+        hidden_states, masked_m, event, hook, topk_ids = self._dispatch_core(
             hidden_states,
             topk_ids,
         )
@@ -737,7 +783,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 **fp8_deepgemm_scale_opts,
             )
         )
-        return packed_recv_hidden, self.packed_recv_count, event, hook
+        return packed_recv_hidden, self.packed_recv_count, event, hook, topk_ids
 
     def combine_a(
         self,

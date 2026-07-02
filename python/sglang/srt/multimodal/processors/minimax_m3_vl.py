@@ -88,28 +88,6 @@ def get_hw_multiple_of(
     return new_w, new_h
 
 
-def vllm_resize(
-    height: int,
-    width: int,
-    factor: int,
-    max_size: Tuple[int, int],
-) -> Tuple[int, int]:
-    """
-    Wrapper around get_hw_multiple_of.
-
-    Args:
-        height: Image height
-        width: Image width
-        factor: Alignment factor (patch_size * merge_size)
-        max_size: (max_width, max_height) constraint
-
-    Returns:
-        Tuple[int, int]: (new_height, new_width)
-    """
-    new_w, new_h = get_hw_multiple_of((width, height), factor, max_size)
-    return new_h, new_w
-
-
 def _compute_sampled_frame_indices(
     total_frames: int,
     video_fps: float,
@@ -151,9 +129,14 @@ def _compute_sampled_frame_indices(
         indices = [0]
     if max_frames is not None and len(indices) > max_frames > 0:
         last = indices[-1]
-        step = len(indices) / (max_frames - 1)
-        indices = [indices[int(i * step)] for i in range(max_frames - 1)]
-        indices.append(last)
+        if max_frames == 1:
+            # max_frames == 1 would divide by (max_frames - 1) == 0 below;
+            # keep only the last frame, matching the always-keep-last invariant.
+            indices = [last]
+        else:
+            step = len(indices) / (max_frames - 1)
+            indices = [indices[int(i * step)] for i in range(max_frames - 1)]
+            indices.append(last)
     return indices
 
 

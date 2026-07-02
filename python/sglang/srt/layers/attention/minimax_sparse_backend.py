@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
@@ -12,12 +12,32 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_score_type,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
-    minimax_sparse_decode,
-    minimax_sparse_prefill,
+from sglang.srt.layers.attention.minimax_sparse_ops.common.index import (
+    topk_index_reduce,
 )
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils import is_npu
+
+if not is_npu():
+    from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
+        minimax_sparse_decode,
+        minimax_sparse_prefill,
+    )
+
+
+def _npu_use_triton_sparse() -> bool:
+    """Whether the NPU sparse path should use the fused triton kernels.
+
+    The fused Triton path is the default on NPU. Set SGLANG_MINIMAX_NPU_TRITON=0
+    to fall back to the non-Triton sparse decode path.
+    """
+    import os
+
+    return is_npu() and bool(
+        int(os.environ.get("SGLANG_MINIMAX_NPU_TRITON", "1"))
+    )
+
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -28,6 +48,7 @@ logger = logging.getLogger(__name__)
 class MiniMaxSparseAttnBackend(AttentionBackend):
     def __init__(self, runner: ModelRunner):
         assert isinstance(runner.token_to_kv_pool, MiniMaxSparseKVPool)
+        self.is_npu = is_npu()
         self.kv_pool = runner.token_to_kv_pool
         self.req_to_token = runner.req_to_token_pool.req_to_token
         self.max_context_len = int(runner.model_config.context_len)
@@ -42,7 +63,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             get_minimax_sparse_disable_value_layer_ids(sparse_cfg)
         )
         self.score_type: str = get_minimax_sparse_score_type(sparse_cfg)
-        # assert self.idx_head_dim == head_dim
 
         # max_seqlen for the current forward pass, stored as a plain Python int
         # so that it is safe to use inside CUDA graphs (no .item() at graph time).
@@ -73,26 +93,30 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # The lightning indexer remains unchanged; missing fmha_sm100 keeps the
         # existing Triton path.
         from sglang.srt.environ import envs
-        from sglang.srt.layers.attention.minimax_sparse_ops.msa import (
-            msa_available,
-        )
 
         # MSA (fmha_sm100) is bf16/fp16-only. With an fp8 main KV cache
         # (--kv-cache-dtype fp8_*) keep the sparse path on Triton (it dequants fp8 on
         # load) rather than feeding fp8 bytes to the bf16 kernel; mirrors vLLM's
         # select_main_impl_cls (fp8 KV -> Triton, never MSA).
-        _main_kv_is_fp8 = self.kv_pool.main_pool.dtype in (
-            torch.float8_e4m3fn,
-            torch.float8_e5m2,
-        )
-        self.use_msa = (
-            not envs.SGLANG_DISABLE_MSA.get()
-            and msa_available()
-            and self.block_size_k == 128
-            and self.kv_pool.page_size == self.block_size_k
-            and self.topk_blocks in (4, 8, 16, 32)
-            and not _main_kv_is_fp8
-        )
+        if self.is_npu:
+            self.use_msa = False
+        else:
+            from sglang.srt.layers.attention.minimax_sparse_ops.msa import (
+                msa_available,
+            )
+
+            _main_kv_is_fp8 = self.kv_pool.main_pool.dtype in (
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
+            )
+            self.use_msa = (
+                not envs.SGLANG_DISABLE_MSA.get()
+                and msa_available()
+                and self.block_size_k == 128
+                and self.kv_pool.page_size == self.block_size_k
+                and self.topk_blocks in (4, 8, 16, 32)
+                and not _main_kv_is_fp8
+            )
         # Per-forward MSA decode metadata (page table + fmha plan), shared by every
         # sparse layer of a forward; (re)built in init_forward_metadata_out_graph.
         self._msa_dec_meta = None
@@ -115,7 +139,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         self.page_size = self.kv_pool.page_size
         self.use_dense_sparse_decode = (
-            envs.SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE.get()
+            (not self.is_npu)
+            and envs.SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE.get()
             and self.block_size_k % self.page_size == 0
         )
         # MSA fmha_sm100 decode is NOT cuda-graph-safe: captured & replayed it returns
@@ -250,6 +275,656 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
+    def _raise_npu_sparse_not_ready(self, phase: str, reason: str) -> None:
+        raise NotImplementedError(
+            "MiniMax-M3 NPU sparse attention needs native fused operators for "
+            f"{phase}: {reason}. Missing/target operators include "
+            "flash_prefill_with_topk_index, flash_decode_with_topk_idx, "
+            "flash_*_with_gqa_share_sparse, minimax_decode_topk, "
+            "minimax_decode_topk_page_table, topk_index_reduce, and "
+            "minimax_store_kv_index. The current NPU path provides a slow "
+            "PyTorch correctness fallback only for supported score/cache layouts."
+        )
+
+    @staticmethod
+    def _cache_as_slots(cache: torch.Tensor) -> torch.Tensor:
+        if cache.dim() <= 3:
+            return cache
+        return cache.reshape(-1, cache.shape[-2], cache.shape[-1])
+
+    def _merge_sparse_blocks(
+        self,
+        topk_blocks: torch.Tensor,
+        query_positions: torch.Tensor,
+        num_blocks: int,
+    ) -> torch.Tensor:
+        """Append forced init/local blocks to top-k block ids and deduplicate."""
+        total = self.topk_blocks + self.init_blocks + self.local_blocks
+        if self.init_blocks <= 0 and self.local_blocks <= 0:
+            return topk_blocks
+
+        block_size = self.block_size_k
+        q_len = query_positions.shape[0]
+        num_idx_heads = topk_blocks.shape[1]
+        qcol = query_positions[:, None, None]
+
+        if self.init_blocks == 0 and self.local_blocks == 1:
+            local = (query_positions // block_size).clamp(
+                min=0, max=max(num_blocks - 1, 0)
+            )
+            local = local.to(topk_blocks.dtype).view(q_len, 1, 1).expand(
+                -1, num_idx_heads, -1
+            )
+            valid_topk = (topk_blocks >= 0) & (topk_blocks < num_blocks)
+            valid_topk = valid_topk & (topk_blocks * block_size <= qcol)
+            local_duplicate = ((topk_blocks == local) & valid_topk).any(
+                dim=-1, keepdim=True
+            )
+            valid_local = (local >= 0) & (local < num_blocks)
+            valid_local = (
+                valid_local & (local * block_size <= qcol) & ~local_duplicate
+            )
+            return torch.cat(
+                [
+                    torch.where(
+                        valid_topk, topk_blocks, torch.full_like(topk_blocks, -1)
+                    ),
+                    torch.where(valid_local, local, torch.full_like(local, -1)),
+                ],
+                dim=-1,
+            )
+
+        forced_parts = []
+        if self.init_blocks > 0:
+            forced_parts.append(
+                torch.arange(
+                    self.init_blocks,
+                    device=topk_blocks.device,
+                    dtype=topk_blocks.dtype,
+                )
+                .view(1, 1, -1)
+                .expand(q_len, num_idx_heads, -1)
+            )
+        if self.local_blocks > 0:
+            offsets = torch.arange(
+                self.local_blocks,
+                device=topk_blocks.device,
+                dtype=query_positions.dtype,
+            )
+            block_ids = query_positions // block_size
+            first = (block_ids - self.local_blocks + 1).clamp(min=0)
+            forced_parts.append(
+                (first[:, None] + offsets[None, :])
+                .to(topk_blocks.dtype)
+                .view(q_len, 1, -1)
+                .expand(-1, num_idx_heads, -1)
+            )
+
+        forced = torch.cat(forced_parts, dim=-1)
+        candidates = torch.cat([forced, topk_blocks], dim=-1)
+        valid = (candidates >= 0) & (candidates < num_blocks)
+        valid = valid & (candidates * block_size <= qcol)
+        invalid_value = torch.full_like(candidates, num_blocks)
+        sorted_candidates = torch.sort(
+            torch.where(valid, candidates, invalid_value), dim=-1
+        ).values
+        sorted_valid = sorted_candidates < num_blocks
+        previous = torch.cat(
+            [
+                torch.full_like(sorted_candidates[..., :1], -1),
+                sorted_candidates[:, :, :-1],
+            ],
+            dim=-1,
+        )
+        keep = sorted_valid & (sorted_candidates != previous)
+        ranks = torch.cumsum(keep.to(torch.int32), dim=-1) - 1
+        output = torch.full(
+            (q_len, num_idx_heads, total + 1),
+            -1,
+            dtype=topk_blocks.dtype,
+            device=topk_blocks.device,
+        )
+        overflow_rank = torch.full_like(ranks, total)
+        scatter_index = torch.where(
+            keep & (ranks < total), ranks, overflow_rank
+        ).long()
+        scatter_src = torch.where(keep, sorted_candidates, -1)
+        output.scatter_(2, scatter_index, scatter_src)
+        return output[:, :, :total]
+
+    def _select_sparse_blocks(
+        self,
+        idx_q_seq: torch.Tensor,
+        idx_k_seq: torch.Tensor,
+        query_positions: torch.Tensor,
+        seq_len: int,
+    ) -> torch.Tensor:
+        """Score index blocks with per-query causal masking."""
+        block_size = self.block_size_k
+        num_blocks = (seq_len + block_size - 1) // block_size
+        total = self.topk_blocks + self.init_blocks + self.local_blocks
+        if num_blocks == 0:
+            return torch.full(
+                (idx_q_seq.shape[0], idx_q_seq.shape[1], total),
+                -1,
+                dtype=torch.int32,
+                device=idx_q_seq.device,
+            )
+
+        # bf16 matmul (fast on NPU), upcast to fp32 only for scoring/softmax
+        # aggregation — matches vLLM-ascend MiniMax prefill (patch einsum+scores.float()).
+        scores = torch.einsum("qhd,kd->qhk", idx_q_seq, idx_k_seq).float()
+        padded = num_blocks * block_size
+        if padded != seq_len:
+            scores = torch.nn.functional.pad(scores, (0, padded - seq_len), value=-1e30)
+
+        key_pos = torch.arange(
+            padded, device=idx_q_seq.device, dtype=query_positions.dtype
+        )
+        valid = (key_pos[None, :] < seq_len) & (
+            key_pos[None, :] <= query_positions[:, None]
+        )
+        scores = scores.masked_fill(~valid[:, None, :], -1e30)
+
+        q_len, num_idx_heads, _ = idx_q_seq.shape
+        blocked = scores.view(q_len, num_idx_heads, num_blocks, block_size)
+        if self.score_type == "max":
+            block_scores = blocked.amax(dim=-1)
+        elif self.score_type == "lse":
+            block_scores = torch.logsumexp(blocked, dim=-1)
+        elif self.score_type == "sum":
+            block_scores = blocked.sum(dim=-1)
+        elif self.score_type in ("mean", "avg"):
+            block_scores = blocked.mean(dim=-1)
+        else:
+            self._raise_npu_sparse_not_ready(
+                "top-k block scoring", f"unsupported score_type={self.score_type!r}"
+            )
+
+        actual_topk = min(self.topk_blocks, num_blocks)
+        blocks = torch.topk(block_scores, k=actual_topk, dim=-1).indices.to(torch.int32)
+        if actual_topk < self.topk_blocks:
+            blocks = torch.nn.functional.pad(
+                blocks, (0, self.topk_blocks - actual_topk), value=-1
+            )
+        return self._merge_sparse_blocks(blocks, query_positions, num_blocks)
+
+    def _expand_blocks_to_tokens(
+        self, block_indices: torch.Tensor, seq_len: int
+    ) -> torch.Tensor:
+        offsets = torch.arange(
+            self.block_size_k, device=block_indices.device, dtype=block_indices.dtype
+        )
+        token_idx = block_indices[..., None] * self.block_size_k + offsets
+        valid = (block_indices[..., None] >= 0) & (token_idx < seq_len)
+        token_idx = token_idx.flatten(start_dim=-2)
+        return torch.where(
+            valid.flatten(start_dim=-2), token_idx, torch.full_like(token_idx, -1)
+        )
+
+    @staticmethod
+    def _sparse_attention_group(
+        q_group: torch.Tensor,
+        k_kvhead: torch.Tensor,
+        v_kvhead: torch.Tensor,
+        token_idx: torch.Tensor,
+        query_positions: torch.Tensor,
+        seq_len: int,
+        scale: float,
+    ) -> torch.Tensor:
+        q_len, _, head_dim = q_group.shape
+        num_selected = token_idx.shape[-1]
+        if num_selected == 0 or seq_len == 0:
+            return q_group.new_zeros(q_group.shape)
+
+        # Masked-full attention (gather-free). The original gathered each query's
+        # selected tokens via index_select — q_len*num_selected scattered rows,
+        # ~1.9 GB/layer, ~91% of prefill time on NPU (GatherV3). The QK/PV matmuls
+        # are <3% of prefill and NPU matmul is fast, so compute attention over the
+        # full contiguous KV and mask non-selected positions to -inf. Numerically
+        # identical to the sparse version (masked tokens take zero softmax weight).
+        key_pos = torch.arange(seq_len, device=q_group.device, dtype=torch.long)
+        causal = key_pos[None, :] <= query_positions[:, None]  # [q_len, seq_len]
+        valid_sel = (token_idx >= 0) & (token_idx < seq_len)
+        # A trash column at index `seq_len` absorbs invalid (padded -1) entries so
+        # plain scatter never clobbers a genuinely selected position (no reduce=).
+        sel = torch.zeros((q_len, seq_len + 1), dtype=torch.bool, device=q_group.device)
+        safe_idx = torch.where(
+            valid_sel, token_idx.long(), torch.full_like(token_idx, seq_len)
+        )
+        sel.scatter_(1, safe_idx, True)
+        keep = sel[:, :seq_len] & causal  # [q_len, seq_len]
+
+        scores = torch.einsum("qhd,kd->qhk", q_group, k_kvhead).float() * scale
+        scores = scores.masked_fill(~keep[:, None, :], -1e30)
+        probs = torch.softmax(scores, dim=-1).to(v_kvhead.dtype)
+        return torch.einsum("qhk,kd->qhd", probs, v_kvhead)
+
+    @staticmethod
+    def _index_dense_attention(
+        idx_q_seq: torch.Tensor,
+        idx_k_seq: torch.Tensor,
+        idx_v_seq: torch.Tensor,
+        query_positions: torch.Tensor,
+        seq_len: int,
+        scale: float,
+    ) -> torch.Tensor:
+        # bf16 matmul (fast on NPU), upcast to fp32 only for scoring/softmax
+        # aggregation — matches vLLM-ascend MiniMax prefill (patch einsum+scores.float()).
+        scores = torch.einsum("qhd,kd->qhk", idx_q_seq, idx_k_seq).float()
+        scores = scores * scale
+        key_pos = torch.arange(
+            seq_len, device=idx_q_seq.device, dtype=query_positions.dtype
+        )
+        valid = key_pos[None, :] <= query_positions[:, None]
+        scores = scores.masked_fill(~valid[:, None, :], -1e30)
+        probs = torch.softmax(scores, dim=-1)
+        return torch.einsum("qhk,kd->qhd", probs.to(idx_v_seq.dtype), idx_v_seq)
+
+    def _npu_sparse_seq(
+        self,
+        q_seq: torch.Tensor,
+        k_seq: torch.Tensor,
+        v_seq: torch.Tensor,
+        idx_q_seq: torch.Tensor,
+        idx_k_seq: torch.Tensor,
+        idx_v_seq: Optional[torch.Tensor],
+        query_positions: torch.Tensor,
+        seq_len: int,
+    ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+        if seq_len <= 0:
+            idx_o = None if idx_v_seq is None else idx_q_seq.new_zeros(idx_q_seq.shape)
+            return idx_o, q_seq.new_zeros(q_seq.shape)
+
+        num_q_heads = q_seq.shape[1]
+        num_kv_heads = k_seq.shape[1]
+        num_idx_heads = idx_q_seq.shape[1]
+        head_dim = q_seq.shape[-1]
+        if num_q_heads % num_kv_heads != 0:
+            self._raise_npu_sparse_not_ready(
+                "main sparse attention",
+                f"num_q_heads={num_q_heads} not divisible by num_kv_heads={num_kv_heads}",
+            )
+        group_size = num_q_heads // num_kv_heads
+        if num_idx_heads % num_kv_heads != 0:
+            self._raise_npu_sparse_not_ready(
+                "main sparse attention",
+                f"num_idx_heads={num_idx_heads} not divisible by "
+                f"num_kv_heads={num_kv_heads}",
+            )
+        idx_group_size = num_idx_heads // num_kv_heads
+
+        blocks = self._select_sparse_blocks(
+            idx_q_seq, idx_k_seq, query_positions, seq_len
+        )
+        token_idx = self._expand_blocks_to_tokens(blocks, seq_len)
+        num_selected = token_idx.shape[-1]
+        if idx_group_size > 1:
+            main_token_idx = topk_index_reduce(
+                token_idx.view(-1, num_kv_heads, idx_group_size, num_selected), dim=2
+            )
+        else:
+            main_token_idx = token_idx
+
+        main_scale = head_dim**-0.5
+        out = q_seq.new_zeros(q_seq.shape)
+        for kv_head in range(num_kv_heads):
+            q_group = q_seq[
+                :, kv_head * group_size : (kv_head + 1) * group_size, :
+            ]
+            out[
+                :, kv_head * group_size : (kv_head + 1) * group_size, :
+            ] = self._sparse_attention_group(
+                q_group,
+                k_seq[:, kv_head, :],
+                v_seq[:, kv_head, :],
+                main_token_idx[:, kv_head, :],
+                query_positions,
+                seq_len,
+                main_scale,
+            )
+
+        idx_out = None
+        if idx_v_seq is not None:
+            idx_scale = idx_q_seq.shape[-1] ** -0.5
+            idx_out = self._index_dense_attention(
+                idx_q_seq, idx_k_seq, idx_v_seq, query_positions, seq_len, idx_scale
+            )
+        return idx_out, out
+
+    def _forward_npu_sparse_prefill(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        idx_q: torch.Tensor,
+        idx_k_cache: torch.Tensor,
+        idx_v_cache: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        cu_seqlens: torch.Tensor,
+        seq_lens: torch.Tensor,
+        prefix_lens: torch.Tensor,
+    ):
+        k_slots = self._cache_as_slots(k_cache)
+        v_slots = self._cache_as_slots(v_cache)
+        idx_k_slots = self._cache_as_slots(idx_k_cache)
+        idx_v_slots = (
+            None if idx_v_cache is None else self._cache_as_slots(idx_v_cache)
+        )
+        out = q.new_zeros(q.shape)
+        idx_out = None if idx_v_slots is None else idx_q.new_zeros(idx_q.shape)
+
+        for batch_id in range(forward_batch.req_pool_indices.shape[0]):
+            req_idx = int(forward_batch.req_pool_indices[batch_id].item())
+            q_start = int(cu_seqlens[batch_id].item())
+            q_end = int(cu_seqlens[batch_id + 1].item())
+            if q_end <= q_start:
+                continue
+            prefix_len = int(prefix_lens[batch_id].item())
+            total_len = int(seq_lens[batch_id].item())
+            q_len = q_end - q_start
+            locs = self.req_to_token[req_idx, :total_len].to(
+                device=k_slots.device, dtype=torch.long
+            )
+            # Fast path: NPU ``index_select`` on the paged KV pool is
+            # pathologically slow here (~33 ms/call, ~90% of prefill time).
+            # Prefill slots are handed out as a contiguous run by the token
+            # pool, so when ``locs`` is contiguous a direct slice (a zero-copy
+            # view) replaces the scattered gather and the GatherV3 cost
+            # vanishes. Fall back to index_select for fragmented allocations.
+            is_contig = total_len <= 1 or bool(
+                (locs[1:] - locs[:-1] == 1).all().item()
+            )
+            if is_contig:
+                sl = slice(int(locs[0].item()), int(locs[0].item()) + total_len)
+                k_seq = k_slots[sl]
+                v_seq = v_slots[sl]
+                idx_k_seq = idx_k_slots[sl, 0, :]
+                idx_v_seq = (
+                    None if idx_v_slots is None else idx_v_slots[sl, 0, :]
+                )
+                
+            else:
+                k_seq = k_slots.index_select(0, locs)
+                v_seq = v_slots.index_select(0, locs)
+                idx_k_seq = idx_k_slots.index_select(0, locs)[:, 0, :]
+                idx_v_seq = (
+                    None
+                    if idx_v_slots is None
+                    else idx_v_slots.index_select(0, locs)[:, 0, :]
+                )
+            query_positions = torch.arange(
+                prefix_len,
+                prefix_len + q_len,
+                device=q.device,
+                dtype=torch.long,
+            )
+            idx_o_seq, o_seq = self._npu_sparse_seq(
+                q[q_start:q_end],
+                k_seq,
+                v_seq,
+                idx_q[q_start:q_end],
+                idx_k_seq,
+                idx_v_seq,
+                query_positions,
+                total_len,
+            )
+            out[q_start:q_end] = o_seq
+            if idx_out is not None:
+                idx_out[q_start:q_end] = idx_o_seq
+        return idx_out, out
+
+    def _forward_npu_sparse_decode(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        idx_q: torch.Tensor,
+        idx_k_cache: torch.Tensor,
+        idx_v_cache: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+    ):
+        k_slots = self._cache_as_slots(k_cache)
+        v_slots = self._cache_as_slots(v_cache)
+        idx_k_slots = self._cache_as_slots(idx_k_cache)
+        idx_v_slots = (
+            None if idx_v_cache is None else self._cache_as_slots(idx_v_cache)
+        )
+        out = q.new_zeros(q.shape)
+        idx_out = None if idx_v_slots is None else idx_q.new_zeros(idx_q.shape)
+
+        for batch_id in range(q.shape[0]):
+            req_idx = int(forward_batch.req_pool_indices[batch_id].item())
+            total_len = int(forward_batch.seq_lens[batch_id].item())
+            locs = self.req_to_token[req_idx, :total_len].to(
+                device=k_slots.device, dtype=torch.long
+            )
+            # Fast path: NPU ``index_select`` on the paged KV pool is
+            # pathologically slow here (~33 ms/call, ~90% of prefill time).
+            # Prefill slots are handed out as a contiguous run by the token
+            # pool, so when ``locs`` is contiguous a direct slice (a zero-copy
+            # view) replaces the scattered gather and the GatherV3 cost
+            # vanishes. Fall back to index_select for fragmented allocations.
+            is_contig = total_len <= 1 or bool(
+                (locs[1:] - locs[:-1] == 1).all().item()
+            )
+            if is_contig:
+                sl = slice(int(locs[0].item()), int(locs[0].item()) + total_len)
+                k_seq = k_slots[sl]
+                v_seq = v_slots[sl]
+                idx_k_seq = idx_k_slots[sl, 0, :]
+                idx_v_seq = (
+                    None if idx_v_slots is None else idx_v_slots[sl, 0, :]
+                )
+            else:
+                k_seq = k_slots.index_select(0, locs)
+                v_seq = v_slots.index_select(0, locs)
+                idx_k_seq = idx_k_slots.index_select(0, locs)[:, 0, :]
+                idx_v_seq = (
+                    None
+                    if idx_v_slots is None
+                    else idx_v_slots.index_select(0, locs)[:, 0, :]
+                )
+            query_positions = torch.tensor(
+                [max(total_len - 1, 0)], device=q.device, dtype=torch.long
+            )
+            idx_o_seq, o_seq = self._npu_sparse_seq(
+                q[batch_id : batch_id + 1],
+                k_seq,
+                v_seq,
+                idx_q[batch_id : batch_id + 1],
+                idx_k_seq,
+                idx_v_seq,
+                query_positions,
+                total_len,
+            )
+            out[batch_id : batch_id + 1] = o_seq
+            if idx_out is not None:
+                idx_out[batch_id : batch_id + 1] = idx_o_seq
+        return idx_out, out
+
+    def _forward_npu_triton_decode(
+        self,
+        q: torch.Tensor,                       # [B, num_q_heads, head_dim]
+        k_cache: torch.Tensor,                 # [num_slots, num_kv_heads, head_dim] (NHD)
+        v_cache: torch.Tensor,                 # [num_slots, num_kv_heads, head_dim]
+        idx_q: torch.Tensor,                   # [B, num_idx_heads, idx_dim]
+        idx_k_cache: torch.Tensor,             # [num_slots, idx_kv_heads, idx_dim]
+        idx_v_cache: Optional[torch.Tensor],   # [num_slots, idx_kv_heads, idx_dim] or None
+        forward_batch: ForwardBatch,
+    ):
+        """NPU decode via the ported vLLM-ascend triton kernels (BNSD paged).
+
+        sglang's NHD paged KV ([slots,H,D], page_size==block_size) reshapes
+        directly to the kernels' [pages,block_size,H,D] layout; the block table
+        is derived from req_to_token.
+        """
+        from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.flash_block_score_decode import (
+            flash_decode_bnsd_with_topk_idx,
+        )
+        from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.topk_sparse_decode import (
+            flash_decode_bnsd_with_gqa_share_sparse,
+        )
+
+        page_size = self.page_size  # == block_size_k
+        num_q_heads = q.shape[1]
+        head_dim = q.shape[2]
+        num_idx_heads = idx_q.shape[1]
+        idx_dim = idx_q.shape[2]
+        import os as _os
+
+        # k_cache layout: NHD slot-major [slots, head_num, head_dim] OR already
+        # paged 4D [pages, page_size, head_num, head_dim]. Handle both.
+        if k_cache.dim() == 4:
+            num_pages, _ps, num_kv_heads, head_dim = k_cache.shape
+            k_bnsd = k_cache
+            v_bnsd = v_cache
+        else:
+            num_kv_heads = k_cache.shape[1]
+            head_dim = k_cache.shape[2]
+            num_pages = k_cache.shape[0] // page_size
+            k_bnsd = k_cache.view(num_pages, page_size, num_kv_heads, head_dim)
+            v_bnsd = v_cache.view(num_pages, page_size, num_kv_heads, head_dim)
+        if _os.environ.get("MINIMAX_NPU_TRITON_DEBUG"):
+            print(
+                f"[DEBUG triton-decode] q={tuple(q.shape)} k_cache={tuple(k_cache.shape)} "
+                f"dim={k_cache.dim()} -> k_bnsd={tuple(k_bnsd.shape)} "
+                f"idx_q={tuple(idx_q.shape)} idx_k={tuple(idx_k_cache.shape)} dim={idx_k_cache.dim()} "
+                f"idx_v={None if idx_v_cache is None else tuple(idx_v_cache.shape)} "
+                f"page_size={page_size} num_kv_heads={num_kv_heads} head_dim={head_dim} "
+                f"req_to_token={tuple(self.req_to_token.shape)} "
+                f"seq_lens={forward_batch.seq_lens.tolist()}",
+                flush=True,
+            )
+
+        # index cache -> BNSD
+        if idx_k_cache.dim() == 4:
+            idx_k_bnsd = idx_k_cache
+            idx_v_bnsd = idx_v_cache
+        else:
+            idx_kv_heads = idx_k_cache.shape[1]
+            idx_k_bnsd = idx_k_cache.view(num_pages, page_size, idx_kv_heads, idx_dim)
+            idx_v_bnsd = (
+                None
+                if idx_v_cache is None
+                else idx_v_cache.view(num_pages, page_size, idx_kv_heads, idx_dim)
+            )
+
+        # block_table[b, blk] = page holding logical block blk of request b.
+        seq_lens = forward_batch.seq_lens.to(torch.int32)
+        max_seqlen = (
+            int(self._max_seqlen_k)
+            if self._max_seqlen_k
+            else int(seq_lens.max().item())
+        )
+        max_blocks = (max_seqlen + page_size - 1) // page_size
+        req_idx = forward_batch.req_pool_indices.long()
+        max_cols = self.req_to_token.shape[1]
+        blk_cols = (
+            torch.arange(max_blocks, device=q.device, dtype=torch.long) * page_size
+        )
+        blk_cols = blk_cols.clamp(max=max_cols - 1)
+        token_slots = self.req_to_token[req_idx][:, blk_cols]  # [B, max_blocks]
+        block_table = (token_slots // page_size).to(torch.int32)
+
+        disable_index_value = idx_v_cache is None
+
+        # 1) indexer: block scoring (idx_k) + index attention (idx_q/k/v) + topk.
+        # Pass init_blocks=0, local_blocks=0 on purpose: the ported triton score
+        # kernel would otherwise *boost* the forced init/local blocks to 1e30/1e29
+        # and let them take slots INSIDE the top-k budget (sentinel injection), so
+        # the local block displaces the k-th real block -> only `topk` blocks
+        # attended. The validated pure-PyTorch path instead selects top-k purely by
+        # score and APPENDS init/local on top (concat + dedup, see
+        # _merge_sparse_blocks), attending to topk+init+local blocks. We select the
+        # pure top-k here and re-append the forced blocks below so the triton path
+        # attends to the identical block set as the PyTorch path. Mismatched, this
+        # diverges ~7% per sparse layer (one dropped 128-token block) and produces
+        # different/garbled decode output under greedy decoding.
+        idx_o, topk_idx = flash_decode_bnsd_with_topk_idx(
+            q=idx_q,
+            sink=None,
+            k_cache_bnsd=idx_k_bnsd,
+            v_cache_bnsd=idx_v_bnsd,
+            block_table=block_table,
+            seq_lens=seq_lens,
+            max_seqlen=max_seqlen,
+            block_size=page_size,
+            topk=self.topk_blocks,
+            init_blocks=0,
+            local_blocks=0,
+            sm_scale=idx_dim ** -0.5,
+            score_type=self.score_type,
+            disable_index_value=disable_index_value,
+        )
+
+        # 2) reduce index heads -> kv heads (no-op when num_idx_heads == num_kv_heads)
+        if num_idx_heads > num_kv_heads:
+            idx_group_size = num_idx_heads // num_kv_heads
+            topk_idx = topk_index_reduce(
+                topk_idx.view(num_kv_heads, idx_group_size, -1, self.topk_blocks),
+                dim=1,
+            )
+
+        # 3) Append the forced init/local blocks on top of the pure top-k, using the
+        # SAME concat+dedup semantics as the pure-PyTorch path (_merge_sparse_blocks)
+        # so triton decode attends to the identical block set. `max_blocks` (batch
+        # max) is a safe upper bound here: the indexer already emitted only valid,
+        # causal block ids per request, and _merge_sparse_blocks only uses num_blocks
+        # for clamping/validity masking. The main sparse kernel accepts the wider
+        # topk_idx (max_topk = topk+init+local) and skips the -1 dedup sentinels.
+        topk_2d = topk_idx.permute(1, 0, 2).contiguous()  # [B, num_kv_heads, topk]
+        # Decode: each query sits at the last token of its sequence.
+        query_positions = (seq_lens.to(torch.long) - 1).clamp(min=0)
+        topk_merged = self._merge_sparse_blocks(topk_2d, query_positions, max_blocks)
+        topk_idx = topk_merged.permute(1, 0, 2).contiguous()  # [num_kv_heads, B, topk+init+local]
+
+        # 4) main sparse attention over the selected blocks
+        o = flash_decode_bnsd_with_gqa_share_sparse(
+            q=q,
+            sink=None,
+            k_cache_bnsd=k_bnsd,
+            v_cache_bnsd=v_bnsd,
+            block_table=block_table,
+            seq_lens=seq_lens,
+            block_size=page_size,
+            topk_idx=topk_idx,
+            sm_scale=head_dim ** -0.5,
+        )
+
+        # DEBUG (opt-in, MINIMAX_NPU_TRITON_DEBUG_DIFF=1): also run the validated
+        # pure-PyTorch path on the identical inputs and log the per-call output
+        # difference on REAL model data. Settles whether the triton-vs-pytorch gap
+        # is ~bf16 noise (~0.3%/layer) or a larger systematic divergence. Logs only
+        # the first few sparse decode calls to avoid spam.
+        import os as _os_dbg
+
+        if _os_dbg.environ.get("MINIMAX_NPU_TRITON_DEBUG_DIFF"):
+            if not hasattr(self, "_dbg_diff_count"):
+                self._dbg_diff_count = 0
+            if self._dbg_diff_count < 5:
+                self._dbg_diff_count += 1
+                try:
+                    _idx_o_ref, _o_ref = self._forward_npu_sparse_decode(
+                        q, k_cache, v_cache, idx_q, idx_k_cache, idx_v_cache, forward_batch
+                    )
+                    _d = (o.float() - _o_ref.float()).abs().max().item()
+                    _r = _d / max(_o_ref.float().abs().max().item(), 1e-6)
+                    logger.warning(
+                        "[MiniMax/NPU triton-vs-pytorch] call #%d: "
+                        "max_abs_diff=%.6f rel=%.5f (q=%s seq_lens=%s)",
+                        self._dbg_diff_count,
+                        _d,
+                        _r,
+                        tuple(q.shape),
+                        forward_batch.seq_lens.tolist(),
+                    )
+                except Exception as _e:  # noqa: BLE001
+                    logger.warning(
+                        "[MiniMax/NPU triton-vs-pytorch] reference compute failed: %s", _e
+                    )
+        return idx_o, o
+
     @staticmethod
     def _is_sparse_kv_cached_by_fusion(
         forward_batch: ForwardBatch, layer_id: int
@@ -349,33 +1024,47 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             q = q[:actual_num_tokens]
             idx_q = idx_q[:actual_num_tokens]
 
-        idx_o, o = minimax_sparse_prefill(
-            q,
-            k_cache,
-            v_cache,
-            None,
-            idx_q,
-            idx_k_cache,
-            idx_v_cache,
-            None,
-            self.req_to_token,
-            forward_batch.req_pool_indices,
-            cu_seqlens,
-            seq_lens,
-            prefix_lens,
-            self._max_seqlen_q,
-            self._max_seqlen_k,
-            self.block_size_q,
-            self.block_size_k,
-            self.topk_blocks,
-            self.init_blocks,
-            self.local_blocks,
-            score_type=self.score_type,
-            disable_index_value=disable_value,
-            use_msa=self.use_msa,
-            # Host seq-lens let get_cu_seqblocks avoid a per-layer .item() sync.
-            seqlens_cpu=forward_batch.extend_seq_lens_cpu,
-        )
+        if self.is_npu:
+            idx_o, o = self._forward_npu_sparse_prefill(
+                q,
+                k_cache,
+                v_cache,
+                idx_q,
+                idx_k_cache,
+                idx_v_cache,
+                forward_batch,
+                cu_seqlens,
+                seq_lens,
+                prefix_lens,
+            )
+        else:
+            idx_o, o = minimax_sparse_prefill(
+                q,
+                k_cache,
+                v_cache,
+                None,
+                idx_q,
+                idx_k_cache,
+                idx_v_cache,
+                None,
+                self.req_to_token,
+                forward_batch.req_pool_indices,
+                cu_seqlens,
+                seq_lens,
+                prefix_lens,
+                self._max_seqlen_q,
+                self._max_seqlen_k,
+                self.block_size_q,
+                self.block_size_k,
+                self.topk_blocks,
+                self.init_blocks,
+                self.local_blocks,
+                score_type=self.score_type,
+                disable_index_value=disable_value,
+                use_msa=self.use_msa,
+                # Host seq-lens let get_cu_seqblocks avoid a per-layer .item() sync.
+                seqlens_cpu=forward_batch.extend_seq_lens_cpu,
+            )
 
         # Pad output back to original size for DP communication
         if actual_num_tokens < original_num_tokens:
@@ -491,32 +1180,54 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     "did not prepare the plan for this forward (gate mismatch)."
                 )
 
-        idx_o, o = minimax_sparse_decode(
-            q,
-            None,
-            k_cache,
-            v_cache,
-            idx_q,
-            None,
-            idx_k_cache,
-            idx_v_cache,
-            self.req_to_token,
-            forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
-            self._max_seqlen_k,
-            1,
-            self.block_size_k,
-            self.topk_blocks,
-            self.init_blocks,
-            self.local_blocks,
-            score_type=self.score_type,
-            disable_index_value=disable_value,
-            dense_main_attn_fn=attn_fn,
-            page_size=self.page_size,
-            use_msa=self._use_msa_decode,
-            msa_kv_indices=msa_kv_indices,
-            msa_plan=msa_plan,
-        )
+        if self.is_npu:
+            if _npu_use_triton_sparse():
+                idx_o, o = self._forward_npu_triton_decode(
+                    q,
+                    k_cache,
+                    v_cache,
+                    idx_q,
+                    idx_k_cache,
+                    idx_v_cache,
+                    forward_batch,
+                )
+            else:
+                idx_o, o = self._forward_npu_sparse_decode(
+                    q,
+                    k_cache,
+                    v_cache,
+                    idx_q,
+                    idx_k_cache,
+                    idx_v_cache,
+                    forward_batch,
+                )
+        else:
+            idx_o, o = minimax_sparse_decode(
+                q,
+                None,
+                k_cache,
+                v_cache,
+                idx_q,
+                None,
+                idx_k_cache,
+                idx_v_cache,
+                self.req_to_token,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                self._max_seqlen_k,
+                1,
+                self.block_size_k,
+                self.topk_blocks,
+                self.init_blocks,
+                self.local_blocks,
+                score_type=self.score_type,
+                disable_index_value=disable_value,
+                dense_main_attn_fn=attn_fn,
+                page_size=self.page_size,
+                use_msa=self._use_msa_decode,
+                msa_kv_indices=msa_kv_indices,
+                msa_plan=msa_plan,
+            )
         return (
             None if idx_o is None else idx_o.reshape(q.shape[0], -1).contiguous(),
             o.reshape(q.shape[0], -1).contiguous(),

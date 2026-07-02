@@ -364,7 +364,7 @@ class NPUMHATokenToKOnlyPool(MHATokenToKOnlyPool):
         loc_info,
         cache_k: torch.Tensor,
     ) -> None:
-        loc, _ = unwrap_write_loc(loc_info)
+        loc, _, _ = unwrap_write_loc(loc_info)
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
         if self.store_dtype != self.dtype:

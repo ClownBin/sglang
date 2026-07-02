@@ -289,6 +289,72 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             return cache
         return cache.reshape(-1, cache.shape[-2], cache.shape[-1])
 
+    @staticmethod
+    def _cpu_int_list(value, limit: Optional[int] = None) -> Optional[list[int]]:
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            data = (
+                value.detach().cpu().tolist()
+                if value.device.type != "cpu"
+                else value.tolist()
+            )
+        else:
+            data = list(value)
+        if limit is not None:
+            data = data[:limit]
+        return [int(item) for item in data]
+
+    def _build_npu_sparse_prefill_meta(
+        self,
+        forward_batch: ForwardBatch,
+        cu_seqlens: torch.Tensor,
+        seq_lens: torch.Tensor,
+        prefix_lens: torch.Tensor,
+    ) -> tuple[list[int], list[tuple[int, int]], list[int], list[int]]:
+        batch_size = int(forward_batch.req_pool_indices.shape[0])
+
+        req_indices = self._cpu_int_list(
+            getattr(forward_batch, "req_pool_indices_cpu", None), batch_size
+        )
+        if req_indices is None:
+            req_indices = self._cpu_int_list(forward_batch.req_pool_indices, batch_size)
+
+        extend_lens = self._cpu_int_list(
+            getattr(forward_batch, "extend_seq_lens_cpu", None), batch_size
+        )
+        if extend_lens is not None:
+            q_ranges = []
+            q_start = 0
+            for q_len in extend_lens:
+                q_end = q_start + q_len
+                q_ranges.append((q_start, q_end))
+                q_start = q_end
+        else:
+            cu_seqlens_cpu = self._cpu_int_list(cu_seqlens, batch_size + 1)
+            assert cu_seqlens_cpu is not None
+            q_ranges = [
+                (cu_seqlens_cpu[i], cu_seqlens_cpu[i + 1])
+                for i in range(batch_size)
+            ]
+
+        seq_lens_cpu = self._cpu_int_list(
+            getattr(forward_batch, "seq_lens_cpu", None), batch_size
+        )
+        if seq_lens_cpu is None:
+            seq_lens_cpu = self._cpu_int_list(seq_lens, batch_size)
+
+        prefix_lens_cpu = self._cpu_int_list(
+            getattr(forward_batch, "extend_prefix_lens_cpu", None), batch_size
+        )
+        if prefix_lens_cpu is None:
+            prefix_lens_cpu = self._cpu_int_list(prefix_lens, batch_size)
+
+        assert req_indices is not None
+        assert seq_lens_cpu is not None
+        assert prefix_lens_cpu is not None
+        return req_indices, q_ranges, seq_lens_cpu, prefix_lens_cpu
+
     def _merge_sparse_blocks(
         self,
         topk_blocks: torch.Tensor,
@@ -468,6 +534,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         query_positions: torch.Tensor,
         seq_len: int,
         scale: float,
+        key_pos: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         q_len, _, head_dim = q_group.shape
         num_selected = token_idx.shape[-1]
@@ -480,7 +547,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # are <3% of prefill and NPU matmul is fast, so compute attention over the
         # full contiguous KV and mask non-selected positions to -inf. Numerically
         # identical to the sparse version (masked tokens take zero softmax weight).
-        key_pos = torch.arange(seq_len, device=q_group.device, dtype=torch.long)
+        if key_pos is None:
+            key_pos = torch.arange(seq_len, device=q_group.device, dtype=torch.long)
         causal = key_pos[None, :] <= query_positions[:, None]  # [q_len, seq_len]
         valid_sel = (token_idx >= 0) & (token_idx < seq_len)
         # A trash column at index `seq_len` absorbs invalid (padded -1) entries so
@@ -505,14 +573,16 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         query_positions: torch.Tensor,
         seq_len: int,
         scale: float,
+        key_pos: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # bf16 matmul (fast on NPU), upcast to fp32 only for scoring/softmax
         # aggregation — matches vLLM-ascend MiniMax prefill (patch einsum+scores.float()).
         scores = torch.einsum("qhd,kd->qhk", idx_q_seq, idx_k_seq).float()
         scores = scores * scale
-        key_pos = torch.arange(
-            seq_len, device=idx_q_seq.device, dtype=query_positions.dtype
-        )
+        if key_pos is None:
+            key_pos = torch.arange(
+                seq_len, device=idx_q_seq.device, dtype=query_positions.dtype
+            )
         valid = key_pos[None, :] <= query_positions[:, None]
         scores = scores.masked_fill(~valid[:, None, :], -1e30)
         probs = torch.softmax(scores, dim=-1)
@@ -565,6 +635,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         main_scale = head_dim**-0.5
         out = q_seq.new_zeros(q_seq.shape)
+        key_pos = torch.arange(
+            seq_len, device=q_seq.device, dtype=query_positions.dtype
+        )
         for kv_head in range(num_kv_heads):
             q_group = q_seq[
                 :, kv_head * group_size : (kv_head + 1) * group_size, :
@@ -579,13 +652,20 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 query_positions,
                 seq_len,
                 main_scale,
+                key_pos,
             )
 
         idx_out = None
         if idx_v_seq is not None:
             idx_scale = idx_q_seq.shape[-1] ** -0.5
             idx_out = self._index_dense_attention(
-                idx_q_seq, idx_k_seq, idx_v_seq, query_positions, seq_len, idx_scale
+                idx_q_seq,
+                idx_k_seq,
+                idx_v_seq,
+                query_positions,
+                seq_len,
+                idx_scale,
+                key_pos,
             )
         return idx_out, out
 
@@ -601,6 +681,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         cu_seqlens: torch.Tensor,
         seq_lens: torch.Tensor,
         prefix_lens: torch.Tensor,
+        prefill_meta: Optional[
+            tuple[list[int], list[tuple[int, int]], list[int], list[int]]
+        ] = None,
     ):
         k_slots = self._cache_as_slots(k_cache)
         v_slots = self._cache_as_slots(v_cache)
@@ -611,14 +694,28 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         out = q.new_zeros(q.shape)
         idx_out = None if idx_v_slots is None else idx_q.new_zeros(idx_q.shape)
 
-        for batch_id in range(forward_batch.req_pool_indices.shape[0]):
-            req_idx = int(forward_batch.req_pool_indices[batch_id].item())
-            q_start = int(cu_seqlens[batch_id].item())
-            q_end = int(cu_seqlens[batch_id + 1].item())
+        if prefill_meta is None:
+            prefill_meta = self._build_npu_sparse_prefill_meta(
+                forward_batch, cu_seqlens, seq_lens, prefix_lens
+            )
+        req_indices, q_ranges, seq_lens_cpu, prefix_lens_cpu = prefill_meta
+        max_position = 0
+        for batch_id, (q_start, q_end) in enumerate(q_ranges):
+            max_position = max(
+                max_position,
+                prefix_lens_cpu[batch_id] + max(q_end - q_start, 0),
+                seq_lens_cpu[batch_id],
+            )
+        positions_buffer = torch.arange(
+            max(max_position, 1), device=q.device, dtype=torch.long
+        )
+
+        for batch_id, (q_start, q_end) in enumerate(q_ranges):
+            req_idx = req_indices[batch_id]
             if q_end <= q_start:
                 continue
-            prefix_len = int(prefix_lens[batch_id].item())
-            total_len = int(seq_lens[batch_id].item())
+            prefix_len = prefix_lens_cpu[batch_id]
+            total_len = seq_lens_cpu[batch_id]
             q_len = q_end - q_start
             locs = self.req_to_token[req_idx, :total_len].to(
                 device=k_slots.device, dtype=torch.long
@@ -640,7 +737,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_v_seq = (
                     None if idx_v_slots is None else idx_v_slots[sl, 0, :]
                 )
-                
+
             else:
                 k_seq = k_slots.index_select(0, locs)
                 v_seq = v_slots.index_select(0, locs)
@@ -650,12 +747,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     if idx_v_slots is None
                     else idx_v_slots.index_select(0, locs)[:, 0, :]
                 )
-            query_positions = torch.arange(
-                prefix_len,
-                prefix_len + q_len,
-                device=q.device,
-                dtype=torch.long,
-            )
+            query_positions = positions_buffer[prefix_len : prefix_len + q_len]
             idx_o_seq, o_seq = self._npu_sparse_seq(
                 q[q_start:q_end],
                 k_seq,
@@ -1022,6 +1114,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             idx_q = idx_q[:actual_num_tokens]
 
         if self.is_npu:
+            prefill_meta = self._build_npu_sparse_prefill_meta(
+                forward_batch, cu_seqlens, seq_lens, prefix_lens
+            )
             idx_o, o = self._forward_npu_sparse_prefill(
                 q,
                 k_cache,
@@ -1033,6 +1128,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 cu_seqlens,
                 seq_lens,
                 prefix_lens,
+                prefill_meta,
             )
         else:
             idx_o, o = minimax_sparse_prefill(

@@ -15,7 +15,7 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
 def _read(path: str) -> str:
-    return (REPO_ROOT / path).read_text()
+    return (REPO_ROOT / path).read_text(encoding="utf-8")
 
 
 class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
@@ -70,6 +70,44 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
         self.assertIn("is_npu", source)
         self.assertIn("_raise_npu_sparse_not_ready", source)
         self.assertRegex(source, r"self\.is_npu\s*=\s*is_npu\(\)")
+
+    def test_npu_sparse_prefill_avoids_metadata_item_syncs(self):
+        source = _read("python/sglang/srt/layers/attention/minimax_sparse_backend.py")
+        tree = ast.parse(source)
+        prefill = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_forward_npu_sparse_prefill"
+        )
+        forbidden_metadata = (
+            "req_pool_indices",
+            "cu_seqlens",
+            "seq_lens",
+            "prefix_lens",
+        )
+
+        item_sources = []
+        for node in ast.walk(prefill):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "item"
+            ):
+                item_sources.append(ast.get_source_segment(source, node.func.value))
+
+        offending = [
+            item_source
+            for item_source in item_sources
+            if item_source is not None
+            and any(name in item_source for name in forbidden_metadata)
+        ]
+        self.assertEqual(
+            offending,
+            [],
+            "NPU sparse prefill should use CPU metadata instead of per-request "
+            ".item() syncs for batch lengths/indices.",
+        )
 
     def test_swigluoai_has_npu_eager_path(self):
         source = _read("python/sglang/srt/models/minimax_m3.py")

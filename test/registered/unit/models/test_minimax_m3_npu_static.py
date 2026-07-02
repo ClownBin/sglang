@@ -131,6 +131,81 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
             ".item() syncs for batch lengths/indices.",
         )
 
+    def test_minimax_sparse_prefill_trims_padding_before_cache_store(self):
+        source = _read("python/sglang/srt/layers/attention/minimax_sparse_backend.py")
+        tree = ast.parse(source)
+        backend_class = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == "MiniMaxSparseAttnBackend"
+        )
+        forward_extend = next(
+            node
+            for node in backend_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "forward_extend"
+        )
+        forward_source = ast.get_source_segment(source, forward_extend)
+        trim_index = forward_source.index("if actual_num_tokens < original_num_tokens:")
+        store_index = forward_source.index("self.kv_pool.set_fused_kv_index_buffer")
+
+        self.assertLess(
+            trim_index,
+            store_index,
+            "TBO-padded MiniMax sparse prefill must trim K/V before KV cache store.",
+        )
+        for tensor_name in ("q", "k", "v", "idx_q", "idx_k"):
+            self.assertIn(
+                f"{tensor_name} = {tensor_name}[:actual_num_tokens]",
+                forward_source,
+            )
+        self.assertIn("idx_v = idx_v[:actual_num_tokens]", forward_source)
+        self.assertIn("cache_loc = forward_batch.out_cache_loc", forward_source)
+        self.assertIn(
+            "if self.is_npu and forward_batch.tbo_parent_token_range is not None:",
+            forward_source,
+        )
+        self.assertIn("cache_loc = cache_loc[:actual_num_tokens]", forward_source)
+
+        store_call = next(
+            node
+            for node in ast.walk(forward_extend)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "set_fused_kv_index_buffer"
+        )
+        self.assertEqual(ast.unparse(store_call.args[1]), "cache_loc")
+
+    def test_minimax_dense_tbo_npu_prefill_slices_cache_store_inputs(self):
+        source = _read("python/sglang/srt/layers/attention/minimax_sparse_backend.py")
+        tree = ast.parse(source)
+        backend_class = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == "MiniMaxHybridAttnBackend"
+        )
+        forward_node = next(
+            node
+            for node in backend_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "forward"
+        )
+        forward_source = ast.get_source_segment(source, forward_node)
+
+        self.assertIn("self.sparse.is_npu", forward_source)
+        self.assertIn(
+            "forward_batch.tbo_parent_token_range is not None", forward_source
+        )
+        self.assertIn("dense_k = dense_k[:actual_num_tokens]", forward_source)
+        self.assertIn("dense_v = dense_v[:actual_num_tokens]", forward_source)
+        self.assertRegex(
+            forward_source,
+            r"forward_batch\.out_cache_loc\s*=\s*"
+            r"original_out_cache_loc\[\s*:actual_num_tokens\s*\]",
+        )
+        self.assertIn("finally:", forward_source)
+        self.assertIn(
+            "forward_batch.out_cache_loc = original_out_cache_loc", forward_source
+        )
+
     def test_swigluoai_has_npu_eager_path(self):
         source = _read("python/sglang/srt/models/minimax_m3.py")
         tree = ast.parse(source)

@@ -1064,22 +1064,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         kv_cached_by_fusion = self._is_sparse_kv_cached_by_fusion(
             forward_batch, layer.layer_id
         )
-        if not kv_cached_by_fusion:
-            self.kv_pool.set_fused_kv_index_buffer(
-                layer,
-                forward_batch.out_cache_loc,
-                k,
-                v,
-                idx_k,
-                None if disable_value else idx_v,
-            )
-        k_cache, v_cache = self.kv_pool.get_kv_buffer(layer.layer_id)
-        if disable_value:
-            idx_k_cache = self.kv_pool.get_index_k_buffer(layer.layer_id)
-            idx_v_cache = None
-        else:
-            idx_k_cache, idx_v_cache = self.kv_pool.get_index_kv_buffer(layer.layer_id)
-
         cu_seqlens = torch.cat(
             [
                 torch.zeros(
@@ -1109,9 +1093,35 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         else:
             actual_num_tokens = int(cu_seqlens[-1].item())
         original_num_tokens = q.shape[0]
+        cache_loc = forward_batch.out_cache_loc
         if actual_num_tokens < original_num_tokens:
             q = q[:actual_num_tokens]
             idx_q = idx_q[:actual_num_tokens]
+            if self.is_npu and forward_batch.tbo_parent_token_range is not None:
+                # TBO pads child out_cache_loc with dummy slots; do not write
+                # padded K/V/index rows into real cache slots.
+                cache_loc = cache_loc[:actual_num_tokens]
+                k = k[:actual_num_tokens]
+                v = v[:actual_num_tokens]
+                idx_k = idx_k[:actual_num_tokens]
+                if idx_v is not None:
+                    idx_v = idx_v[:actual_num_tokens]
+
+        if not kv_cached_by_fusion:
+            self.kv_pool.set_fused_kv_index_buffer(
+                layer,
+                cache_loc,
+                k,
+                v,
+                idx_k,
+                None if disable_value else idx_v,
+            )
+        k_cache, v_cache = self.kv_pool.get_kv_buffer(layer.layer_id)
+        if disable_value:
+            idx_k_cache = self.kv_pool.get_index_k_buffer(layer.layer_id)
+            idx_v_cache = None
+        else:
+            idx_k_cache, idx_v_cache = self.kv_pool.get_index_kv_buffer(layer.layer_id)
 
         if self.is_npu:
             prefill_meta = self._build_npu_sparse_prefill_meta(
@@ -1386,22 +1396,44 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
         # (prepare_mlp_sync_batch -> ceil_align(num_tokens, attn_cp_size * 2)), but
         # flashinfer builds qo_indptr from extend_seq_lens, so q.shape[0] (padded)
         # != qo_indptr[-1] (real) and the paged-prefill kernel raises. Trim q to
-        # the real token count and re-pad the output; k/v stay untrimmed so the
-        # KV-cache write stays aligned with out_cache_loc. Prefill-only.
+        # the real token count and re-pad the output. For NPU TBO child batches,
+        # also trim K/V and out_cache_loc so padded rows never write dummy slots.
         mode = forward_batch.forward_mode
         if mode.is_extend() and forward_batch.extend_seq_lens_cpu is not None:
             actual_num_tokens = int(sum(forward_batch.extend_seq_lens_cpu))
             original_num_tokens = q.shape[0]
             if actual_num_tokens < original_num_tokens:
-                o = self.dense.forward(
-                    q[:actual_num_tokens],
-                    k,
-                    v,
-                    layer,
-                    forward_batch,
-                    save_kv_cache,
-                    **kwargs,
-                )
+                dense_q = q[:actual_num_tokens]
+                dense_k = k
+                dense_v = v
+                original_out_cache_loc = forward_batch.out_cache_loc
+                restore_out_cache_loc = False
+                if (
+                    self.sparse.is_npu
+                    and forward_batch.tbo_parent_token_range is not None
+                    and original_out_cache_loc is not None
+                ):
+                    if dense_k is not None:
+                        dense_k = dense_k[:actual_num_tokens]
+                    if dense_v is not None:
+                        dense_v = dense_v[:actual_num_tokens]
+                    forward_batch.out_cache_loc = original_out_cache_loc[
+                        :actual_num_tokens
+                    ]
+                    restore_out_cache_loc = True
+                try:
+                    o = self.dense.forward(
+                        dense_q,
+                        dense_k,
+                        dense_v,
+                        layer,
+                        forward_batch,
+                        save_kv_cache,
+                        **kwargs,
+                    )
+                finally:
+                    if restore_out_cache_loc:
+                        forward_batch.out_cache_loc = original_out_cache_loc
                 pad_len = original_num_tokens - actual_num_tokens
                 return torch.cat([o, o.new_zeros(pad_len, *o.shape[1:])], dim=0)
 

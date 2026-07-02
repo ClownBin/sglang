@@ -204,6 +204,118 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
             "MiniMax-M3 hidden_size=6144 must avoid the fused Triton residual kernel.",
         )
 
+    def test_minimax_m3_tbo_entry_is_npu_extend_only(self):
+        source = _read("python/sglang/srt/models/minimax_m3.py")
+        tree = ast.parse(source)
+        model_class = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == "MiniMaxM3Model"
+        )
+        forward = next(
+            node
+            for node in model_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "forward"
+        )
+        forward_source = ast.get_source_segment(source, forward)
+
+        self.assertIn("ForwardMode", source)
+        self.assertIn("_is_npu", forward_source)
+        self.assertIn("forward_batch.can_run_tbo", forward_source)
+        self.assertIn(
+            "forward_batch.global_forward_mode == ForwardMode.EXTEND",
+            forward_source,
+        )
+
+    def test_minimax_m3_exposes_tbo_ops(self):
+        source = _read("python/sglang/srt/models/minimax_m3.py")
+        tree = ast.parse(source)
+
+        def class_node(name: str) -> ast.ClassDef:
+            return next(
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.ClassDef) and node.name == name
+            )
+
+        def method_names(node: ast.ClassDef) -> set[str]:
+            return {
+                item.name for item in node.body if isinstance(item, ast.FunctionDef)
+            }
+
+        attention_methods = method_names(class_node("MiniMaxM3Attention"))
+        dense_mlp_methods = method_names(class_node("MiniMaxM3MLP"))
+        moe_methods = method_names(class_node("MiniMaxM3MoE"))
+        decoder_methods = method_names(class_node("MiniMaxM3DecoderLayer"))
+
+        self.assertIn("op_prepare", attention_methods)
+        self.assertIn("op_core", attention_methods)
+        self.assertIn("op_forward", dense_mlp_methods)
+        for name in (
+            "op_gate",
+            "op_shared_experts",
+            "op_select_experts",
+            "op_dispatch_a",
+            "op_dispatch_b",
+            "op_experts",
+            "op_combine_a",
+            "op_combine_b",
+            "op_output",
+        ):
+            self.assertIn(name, moe_methods)
+        for name in (
+            "op_comm_prepare_attn",
+            "op_comm_prepare_mlp",
+            "op_comm_postprocess_layer",
+        ):
+            self.assertIn(name, decoder_methods)
+
+        attention_class = class_node("MiniMaxM3Attention")
+        op_prepare = next(
+            node
+            for node in attention_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "op_prepare"
+        )
+        op_prepare_source = ast.get_source_segment(source, op_prepare)
+        self.assertIn("forward_prepare_npu", op_prepare_source)
+        self.assertIn("_is_npu", op_prepare_source)
+
+    def test_minimax_m3_tbo_strategy_is_npu_prefill_only(self):
+        source = _read("python/sglang/srt/batch_overlap/operations_strategy.py")
+        tree = ast.parse(source)
+        init_new_tbo = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "init_new_tbo"
+        )
+        init_source = ast.get_source_segment(source, init_new_tbo)
+
+        self.assertIn("is_npu", source)
+        self.assertIn("_is_npu = is_npu()", source)
+        self.assertIn('"MiniMaxM3DecoderLayer"', init_source)
+
+        strategy = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_compute_moe_minimax_m3_layer_operations_strategy_tbo"
+        )
+        strategy_source = ast.get_source_segment(source, strategy)
+        self.assertIn("not _is_npu", strategy_source)
+        self.assertIn("forward_mode != ForwardMode.EXTEND", strategy_source)
+        self.assertNotIn("ForwardMode.DECODE", strategy_source)
+
+        prefill = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_compute_moe_minimax_m3_prefill"
+        )
+        prefill_source = ast.get_source_segment(source, prefill)
+        self.assertIn("deep_gemm_num_sms=None", prefill_source)
+        self.assertNotIn("torch.cuda.get_device_properties", prefill_source)
+        self.assertIn("layer.mlp.op_shared_experts", prefill_source)
+
 
 if __name__ == "__main__":
     unittest.main()

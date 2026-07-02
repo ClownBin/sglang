@@ -76,7 +76,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.forward_context import (
     get_forward_context,
     has_forward_context,
@@ -92,6 +96,7 @@ from sglang.srt.utils import (
     get_device_sm,
     is_cuda,
     is_hip,
+    is_non_idle_and_non_empty,
     is_npu,
     log_info_on_rank0,
     make_layers,
@@ -336,6 +341,20 @@ class MiniMaxM3MLP(nn.Module):
         )
         return x
 
+    def op_forward(self, state):
+        hidden_states = state.pop("hidden_states_mlp_input")
+        use_reduce_scatter = state.pop("use_reduce_scatter")
+        if hidden_states.shape[0] == 0:
+            state.hidden_states_mlp_output = hidden_states
+            return
+
+        state.hidden_states_mlp_output = self(
+            hidden_states,
+            forward_batch=state.forward_batch,
+            should_allreduce_fusion=False,
+            use_reduce_scatter=use_reduce_scatter,
+        )
+
 
 class MiniMaxM3MoE(nn.Module):
     """MiniMax MoE implementation using DeepEP for Expert Parallel support."""
@@ -518,6 +537,97 @@ class MiniMaxM3MoE(nn.Module):
             return self.shared_experts(hidden_states)
         else:
             return None
+
+    def op_gate(self, state):
+        if is_non_idle_and_non_empty(
+            state.forward_batch.forward_mode, state.hidden_states_mlp_input
+        ):
+            state.router_logits = self._compute_router_logits(
+                state.hidden_states_mlp_input
+            )
+        else:
+            state.router_logits = None
+
+    def op_shared_experts(self, state):
+        hidden_states_mlp_input = state.pop("hidden_states_mlp_input")
+        if is_non_idle_and_non_empty(
+            state.forward_batch.forward_mode, hidden_states_mlp_input
+        ):
+            state.shared_output = self._forward_shared_experts(hidden_states_mlp_input)
+        else:
+            state.shared_output = None
+
+    def op_select_experts(self, state):
+        router_logits = state.pop("router_logits")
+        hidden_states = state.hidden_states_mlp_input
+
+        if router_logits is not None:
+            ctx = (
+                nullcontext()
+                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                else get_global_expert_distribution_recorder().with_current_layer(
+                    self.layer_id
+                )
+            )
+            with ctx:
+                state.topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                    num_token_non_padded=state.forward_batch.num_token_non_padded,
+                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                        layer_id=self.layer_id,
+                    ),
+                )
+        else:
+            state.topk_output = self.topk.empty_topk_output(hidden_states.device)
+
+    def op_dispatch_a(self, state):
+        if self.ep_size > 1:
+            self.experts.dispatcher.dispatch_a(
+                hidden_states=state.hidden_states_mlp_input,
+                topk_output=state.pop("topk_output"),
+                tbo_subbatch_index=state.get("tbo_subbatch_index"),
+            )
+
+    def op_dispatch_b(self, state):
+        if self.ep_size > 1:
+            ctx = (
+                nullcontext()
+                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                else get_global_expert_distribution_recorder().with_current_layer(
+                    self.layer_id
+                )
+            )
+            with ctx:
+                state.dispatch_output = self.experts.dispatcher.dispatch_b(
+                    tbo_subbatch_index=state.get("tbo_subbatch_index"),
+                )
+
+    def op_experts(self, state):
+        state.combine_input = self.experts.run_moe_core(
+            dispatch_output=state.dispatch_output,
+        )
+
+    def op_combine_a(self, state):
+        if self.ep_size > 1:
+            self.experts.dispatcher.combine_a(
+                combine_input=state.pop("combine_input"),
+                tbo_subbatch_index=state.get("tbo_subbatch_index"),
+            )
+            state.pop("dispatch_output")
+
+    def op_combine_b(self, state):
+        if self.ep_size > 1:
+            state.hidden_states_after_combine = self.experts.dispatcher.combine_b(
+                tbo_subbatch_index=state.get("tbo_subbatch_index"),
+            )
+
+    def op_output(self, state):
+        final_hidden_states = state.pop("hidden_states_after_combine")
+        shared_output = state.pop("shared_output")
+        if shared_output is not None:
+            final_hidden_states = final_hidden_states + shared_output
+        state.hidden_states_mlp_output = final_hidden_states
 
 
 class MiniMaxM3Attention(nn.Module):
@@ -1312,7 +1422,9 @@ class MiniMaxM3Attention(nn.Module):
         return None, forward_batch, inner_state
 
     def forward_core(self, intermediate_state):
-        _, _, inner_state = intermediate_state
+        hidden_states, _, inner_state = intermediate_state
+        if inner_state is None:
+            return hidden_states
 
         if self.is_sparse_attention_layer:
             q, k, v, idx_q, idx_k, idx_v, forward_batch = inner_state
@@ -1369,6 +1481,26 @@ class MiniMaxM3Attention(nn.Module):
                 forward_batch=forward_batch,
             )
         return self.forward_core(s)
+
+    def op_prepare(self, state):
+        hidden_states = state.pop("hidden_states_after_comm_pre_attn")
+        if _is_npu:
+            state.attn_intermediate_state = self.forward_prepare_npu(
+                positions=state.positions,
+                hidden_states=hidden_states,
+                forward_batch=state.forward_batch,
+            )
+        else:
+            state.attn_intermediate_state = self.forward_prepare(
+                positions=state.positions,
+                hidden_states=hidden_states,
+                forward_batch=state.forward_batch,
+            )
+
+    def op_core(self, state):
+        state.hidden_states_after_attn = self.forward_core(
+            state.pop("attn_intermediate_state")
+        )
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
@@ -1552,6 +1684,63 @@ class MiniMaxM3DecoderLayer(nn.Module):
 
         return hidden_states, residual
 
+    def op_comm_prepare_attn(
+        self,
+        state,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        tbo_subbatch_index: Optional[int] = None,
+    ):
+        state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
+            self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
+        )
+        state.update(
+            dict(
+                forward_batch=forward_batch,
+                positions=positions,
+                tbo_subbatch_index=tbo_subbatch_index,
+            )
+        )
+
+    def op_comm_prepare_mlp(self, state):
+        state.hidden_states_mlp_input, state.residual_after_comm_pre_mlp = (
+            self.layer_communicator.prepare_mlp(
+                state.pop("hidden_states_after_attn"),
+                state.pop("residual_after_input_ln"),
+                state.forward_batch,
+            )
+        )
+        if not self.is_layer_sparse:
+            state.use_reduce_scatter = (
+                self.layer_communicator.should_use_reduce_scatter(state.forward_batch)
+            )
+
+    def op_comm_postprocess_layer(self, state):
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            state.pop("hidden_states_mlp_output"),
+            state.pop("residual_after_comm_pre_mlp"),
+            state.forward_batch,
+        )
+
+        output = dict(
+            positions=state.positions,
+            hidden_states=hidden_states,
+            residual=residual,
+            forward_batch=state.forward_batch,
+            tbo_subbatch_index=state.tbo_subbatch_index,
+        )
+
+        state.clear(
+            expect_keys={
+                "positions",
+                "forward_batch",
+                "tbo_subbatch_index",
+            }
+        )
+        return output
+
 
 class MiniMaxM3Model(nn.Module):
     """MiniMax Model implementation."""
@@ -1631,7 +1820,12 @@ class MiniMaxM3Model(nn.Module):
             residual = pp_proxy_tensors["residual"]
 
         aux_hidden_states = []
-        if forward_batch.can_run_tbo:
+        can_run_minimax_m3_tbo = (
+            _is_npu
+            and forward_batch.can_run_tbo
+            and forward_batch.global_forward_mode == ForwardMode.EXTEND
+        )
+        if can_run_minimax_m3_tbo:
             hidden_states, residual = model_forward_maybe_tbo(
                 layers=self.layers,
                 enable_tbo=True,

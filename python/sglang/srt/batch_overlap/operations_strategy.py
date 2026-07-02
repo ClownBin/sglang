@@ -6,10 +6,12 @@ import torch
 from sglang.srt.batch_overlap import operations
 from sglang.srt.batch_overlap.operations import Operation
 from sglang.srt.layers.moe.token_dispatcher import DeepEPConfig
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_npu
 
 _is_hip = is_hip()
+_is_npu = is_npu()
 
 
 @dataclass
@@ -58,6 +60,15 @@ class OperationsStrategy:
             return OperationsStrategy.concat(
                 [
                     _compute_moe_mimov2_layer_operations_strategy_tbo(
+                        layer, forward_mode
+                    )
+                    for layer in layers
+                ]
+            )
+        elif layer_name == "MiniMaxM3DecoderLayer":
+            return OperationsStrategy.concat(
+                [
+                    _compute_moe_minimax_m3_layer_operations_strategy_tbo(
                         layer, forward_mode
                     )
                     for layer in layers
@@ -298,5 +309,63 @@ def _compute_moe_mimov2_decode(layer):
             layer.mlp.op_output,
             layer.op_comm_postprocess_layer,
             operations.YieldOperation(),
+        ],
+    )
+
+
+# -------------------------------- Strategy for MiniMaxM3DecoderLayer ---------------------------------------
+
+
+def _compute_moe_minimax_m3_layer_operations_strategy_tbo(
+    layer: torch.nn.Module,
+    forward_mode: ForwardMode,
+) -> OperationsStrategy:
+    if not _is_npu:
+        raise NotImplementedError("MiniMax-M3 TBO is currently NPU-only")
+    if forward_mode != ForwardMode.EXTEND:
+        raise NotImplementedError("MiniMax-M3 TBO is currently prefill/extend only")
+    if not get_moe_a2a_backend().is_deepep():
+        raise NotImplementedError("MiniMax-M3 TBO currently requires DeepEP")
+    if layer.is_layer_sparse and getattr(layer.mlp, "ep_size", 1) <= 1:
+        raise NotImplementedError("MiniMax-M3 TBO requires EP size > 1")
+
+    return _compute_moe_minimax_m3_prefill(layer)
+
+
+def _compute_moe_minimax_m3_prefill(layer):
+    if not layer.is_layer_sparse:
+        return OperationsStrategy(
+            deep_gemm_num_sms=None,
+            tbo_delta_stages=0,
+            operations=[
+                layer.op_comm_prepare_attn,
+                layer.self_attn.op_prepare,
+                layer.self_attn.op_core,
+                layer.op_comm_prepare_mlp,
+                layer.mlp.op_forward,
+                layer.op_comm_postprocess_layer,
+            ],
+        )
+
+    return OperationsStrategy(
+        deep_gemm_num_sms=None,
+        tbo_delta_stages=0,
+        operations=[
+            layer.op_comm_prepare_attn,
+            layer.self_attn.op_prepare,
+            layer.self_attn.op_core,
+            layer.op_comm_prepare_mlp,
+            layer.mlp.op_gate,
+            layer.mlp.op_select_experts,
+            layer.mlp.op_dispatch_a,
+            operations.YieldOperation(),
+            layer.mlp.op_dispatch_b,
+            layer.mlp.op_experts,
+            layer.mlp.op_combine_a,
+            operations.YieldOperation(),
+            layer.mlp.op_shared_experts,
+            layer.mlp.op_combine_b,
+            layer.mlp.op_output,
+            layer.op_comm_postprocess_layer,
         ],
     )

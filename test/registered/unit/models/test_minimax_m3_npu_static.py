@@ -204,6 +204,82 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
             "MiniMax-M3 hidden_size=6144 must avoid the fused Triton residual kernel.",
         )
 
+    def test_minimax_m3_exposes_tbo_operation_contracts(self):
+        source = _read("python/sglang/srt/models/minimax_m3.py")
+        tree = ast.parse(source)
+        classes = {
+            node.name: node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)
+        }
+
+        attention_methods = {
+            node.name
+            for node in classes["MiniMaxM3Attention"].body
+            if isinstance(node, ast.FunctionDef)
+        }
+        moe_methods = {
+            node.name
+            for node in classes["MiniMaxM3MoE"].body
+            if isinstance(node, ast.FunctionDef)
+        }
+        decoder_methods = {
+            node.name
+            for node in classes["MiniMaxM3DecoderLayer"].body
+            if isinstance(node, ast.FunctionDef)
+        }
+
+        self.assertIn("op_prepare", attention_methods)
+        self.assertIn("op_core", attention_methods)
+        self.assertTrue(
+            {
+                "op_gate",
+                "op_select_experts",
+                "op_dispatch_a",
+                "op_dispatch_b",
+                "op_experts",
+                "op_combine_a",
+                "op_combine_b",
+                "op_shared_experts",
+                "op_output",
+            }.issubset(moe_methods)
+        )
+        self.assertTrue(
+            {
+                "op_comm_prepare_attn",
+                "op_comm_prepare_mlp",
+                "op_comm_postprocess_layer",
+            }.issubset(decoder_methods)
+        )
+
+    def test_minimax_m3_attention_core_handles_empty_tbo_subbatch(self):
+        source = _read("python/sglang/srt/models/minimax_m3.py")
+        tree = ast.parse(source)
+        attention_class = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == "MiniMaxM3Attention"
+        )
+        forward_core = next(
+            node
+            for node in attention_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "forward_core"
+        )
+        forward_core_source = ast.get_source_segment(source, forward_core)
+
+        self.assertRegex(
+            forward_core_source,
+            r"if\s+inner_state\s+is\s+None:\s*\n\s+return\s+hidden_states",
+            "TBO runs attention op_core for every subbatch; empty subbatches must "
+            "short-circuit before sparse attention unpacking.",
+        )
+
+    def test_minimax_m3_registered_in_tbo_strategy(self):
+        source = _read("python/sglang/srt/batch_overlap/operations_strategy.py")
+
+        self.assertIn('layer_name == "MiniMaxM3DecoderLayer"', source)
+        self.assertIn("_compute_moe_minimax_m3_layer_operations_strategy_tbo", source)
+        self.assertIn("_compute_moe_minimax_m3_prefill", source)
+        self.assertIn("_compute_moe_minimax_m3_decode", source)
+
 
 if __name__ == "__main__":
     unittest.main()

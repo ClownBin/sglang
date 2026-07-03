@@ -1742,6 +1742,7 @@ class MiniMaxM3Model(nn.Module):
             pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
+        self.first_tbo_layer = self._compute_first_tbo_layer(config)
         if self.pp_group.is_last_rank:
             if self.use_gemma_norm:
                 self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1752,6 +1753,21 @@ class MiniMaxM3Model(nn.Module):
 
         # For EAGLE3 support
         self.layers_to_capture = []
+
+    @staticmethod
+    def _compute_first_tbo_layer(config: PretrainedConfig) -> int:
+        moe_layer_freq = getattr(config, "moe_layer_freq", None)
+        if moe_layer_freq is None:
+            return 0
+        if isinstance(moe_layer_freq, int):
+            return 0 if moe_layer_freq != 0 else config.num_hidden_layers
+
+        first_tbo_layer = config.num_hidden_layers
+        for layer_id in range(config.num_hidden_layers - 1, -1, -1):
+            if layer_id >= len(moe_layer_freq) or moe_layer_freq[layer_id] == 0:
+                break
+            first_tbo_layer = layer_id
+        return first_tbo_layer
 
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
@@ -1776,38 +1792,51 @@ class MiniMaxM3Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        aux_hidden_states = []
+        normal_start_layer = self.start_layer
+        normal_end_layer = self.end_layer
         if forward_batch.can_run_tbo:
+            normal_end_layer = min(
+                max(self.first_tbo_layer, normal_start_layer), normal_end_layer
+            )
+
+        aux_hidden_states = []
+        for i in range(normal_start_layer, normal_end_layer):
+            # NOTE: torch dynamo does not support graph break in context manager
+            ctx = (
+                nullcontext()
+                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                else get_global_expert_distribution_recorder().with_current_layer(i)
+            )
+            with ctx:
+                layer = self.layers[i]
+                hidden_states, residual = layer(
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                    captured_last_layer_outputs=(
+                        aux_hidden_states
+                        if getattr(layer, "_is_layer_to_capture", False)
+                        else None
+                    ),
+                )
+
+        if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(
-                layers=self.layers,
+                layers=self.layers[normal_end_layer : self.end_layer],
                 enable_tbo=True,
-                input_data_scatter_mode=ScatterMode.model_input_output(),
+                input_data_scatter_mode=(
+                    ScatterMode.model_input_output()
+                    if normal_end_layer == self.start_layer
+                    else self.layers[
+                        normal_end_layer - 1
+                    ].layer_scatter_modes.layer_output_mode
+                ),
                 positions=positions,
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,
                 residual=residual,
             )
-        else:
-            for i in range(self.start_layer, self.end_layer):
-                # NOTE: torch dynamo does not support graph break in context manager
-                ctx = (
-                    nullcontext()
-                    if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-                    else get_global_expert_distribution_recorder().with_current_layer(i)
-                )
-                with ctx:
-                    layer = self.layers[i]
-                    hidden_states, residual = layer(
-                        positions=positions,
-                        forward_batch=forward_batch,
-                        hidden_states=hidden_states,
-                        residual=residual,
-                        captured_last_layer_outputs=(
-                            aux_hidden_states
-                            if getattr(layer, "_is_layer_to_capture", False)
-                            else None
-                        ),
-                    )
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(

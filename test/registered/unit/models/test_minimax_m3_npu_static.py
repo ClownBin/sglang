@@ -304,6 +304,35 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
         self.assertIn("_compute_moe_minimax_m3_prefill", source)
         self.assertIn("_compute_moe_minimax_m3_decode", source)
 
+    def test_minimax_m3_tbo_runs_dense_prefix_before_sparse_suffix(self):
+        source = _read("python/sglang/srt/models/minimax_m3.py")
+        tree = ast.parse(source)
+        model_class = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == "MiniMaxM3Model"
+        )
+        forward = next(
+            node
+            for node in model_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "forward"
+        )
+        forward_source = ast.get_source_segment(source, forward)
+
+        self.assertIn("normal_start_layer = self.start_layer", forward_source)
+        self.assertIn("normal_end_layer = self.end_layer", forward_source)
+        self.assertIn("range(normal_start_layer, normal_end_layer)", forward_source)
+        self.assertIn("if normal_end_layer != self.end_layer:", forward_source)
+        self.assertIn(
+            "layers=self.layers[normal_end_layer : self.end_layer]",
+            forward_source,
+        )
+        self.assertRegex(
+            forward_source,
+            r"self\.layers\[\s*normal_end_layer\s*-\s*1\s*\]\.layer_scatter_modes\.layer_output_mode",
+        )
+        self.assertNotIn("layers=self.layers,", forward_source)
+
     def test_minimax_m3_tbo_strategy_avoids_cuda_sms_on_npu_path(self):
         source = _read("python/sglang/srt/batch_overlap/operations_strategy.py")
         tree = ast.parse(source)

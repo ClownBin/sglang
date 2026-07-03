@@ -255,11 +255,9 @@ def _compute_moe_minimax_m3_layer_operations_strategy_tbo(
 
 
 def _compute_moe_minimax_m3_prefill(layer):
+    # MiniMax-M3 TBO is wired for the NPU/Ascend path here. Do not query CUDA
+    # SMs or reserve DeepGEMM CUDA resources on this strategy.
     deep_gemm_num_sms = None
-    if not _is_hip and torch.cuda.is_available():
-        device_properties = torch.cuda.get_device_properties(device="cuda")
-        total_num_sms = device_properties.multi_processor_count
-        deep_gemm_num_sms = total_num_sms - DeepEPConfig.get_instance().num_sms
 
     return OperationsStrategy(
         deep_gemm_num_sms=deep_gemm_num_sms,

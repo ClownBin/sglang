@@ -304,6 +304,88 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
         self.assertIn("_compute_moe_minimax_m3_prefill", source)
         self.assertIn("_compute_moe_minimax_m3_decode", source)
 
+    def test_minimax_m3_tbo_strategy_avoids_cuda_sms_on_npu_path(self):
+        source = _read("python/sglang/srt/batch_overlap/operations_strategy.py")
+        tree = ast.parse(source)
+        prefill = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_compute_moe_minimax_m3_prefill"
+        )
+        prefill_source = ast.get_source_segment(source, prefill)
+
+        self.assertNotIn("torch.cuda", prefill_source)
+        self.assertNotIn("get_device_properties", prefill_source)
+        self.assertNotIn("DeepEPConfig.get_instance", prefill_source)
+        self.assertRegex(prefill_source, r"deep_gemm_num_sms\s*=\s*None")
+
+    def test_minimax_m3_tbo_strategy_preserves_semantic_op_order(self):
+        source = _read("python/sglang/srt/batch_overlap/operations_strategy.py")
+        tree = ast.parse(source)
+
+        def function_source(name):
+            function = next(
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.FunctionDef) and node.name == name
+            )
+            return ast.get_source_segment(source, function)
+
+        def assert_order(function_body, ordered_fragments):
+            indexes = [function_body.index(fragment) for fragment in ordered_fragments]
+            self.assertEqual(indexes, sorted(indexes), ordered_fragments)
+
+        for function_name in (
+            "_compute_moe_minimax_m3_prefill",
+            "_compute_moe_minimax_m3_decode",
+        ):
+            body = function_source(function_name)
+            assert_order(
+                body,
+                [
+                    "layer.op_comm_prepare_attn",
+                    "layer.self_attn.op_prepare",
+                    "layer.self_attn.op_core",
+                    "layer.op_comm_prepare_mlp",
+                    "layer.mlp.op_gate",
+                    "layer.mlp.op_select_experts",
+                    "layer.mlp.op_dispatch_a",
+                    "layer.mlp.op_shared_experts",
+                    "layer.mlp.op_dispatch_b",
+                    "layer.mlp.op_experts",
+                    "layer.mlp.op_combine_a",
+                    "layer.mlp.op_combine_b",
+                    "layer.mlp.op_output",
+                    "layer.op_comm_postprocess_layer",
+                ],
+            )
+
+    def test_minimax_m3_tbo_moe_ops_reuse_forward_deepep_math(self):
+        source = _read("python/sglang/srt/models/minimax_m3.py")
+        tree = ast.parse(source)
+        moe_class = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == "MiniMaxM3MoE"
+        )
+        op_sources = {
+            node.name: ast.get_source_segment(source, node)
+            for node in moe_class.body
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("op_")
+        }
+
+        self.assertIn("_compute_router_logits", op_sources["op_gate"])
+        self.assertIn("num_token_non_padded", op_sources["op_select_experts"])
+        self.assertIn(
+            "ExpertLocationDispatchInfo.init_new",
+            op_sources["op_select_experts"],
+        )
+        self.assertIn("_forward_shared_experts", op_sources["op_shared_experts"])
+        self.assertIn("run_moe_core", op_sources["op_experts"])
+        self.assertIn("combine_b", op_sources["op_combine_b"])
+        self.assertIn("hidden_states + shared_output", op_sources["op_output"])
+
 
 if __name__ == "__main__":
     unittest.main()

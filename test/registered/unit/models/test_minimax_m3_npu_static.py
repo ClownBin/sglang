@@ -71,6 +71,30 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
         self.assertIn("_raise_npu_sparse_not_ready", source)
         self.assertRegex(source, r"self\.is_npu\s*=\s*is_npu\(\)")
 
+    def test_minimax_hybrid_backend_exposes_pool_refs_for_tbo(self):
+        source = _read("python/sglang/srt/layers/attention/minimax_sparse_backend.py")
+        tree = ast.parse(source)
+        hybrid_class = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == "MiniMaxHybridAttnBackend"
+        )
+        init_fn = next(
+            node
+            for node in hybrid_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+        )
+        init_source = ast.get_source_segment(source, init_fn)
+
+        self.assertIn(
+            "self.token_to_kv_pool = dense_backend.token_to_kv_pool",
+            init_source,
+        )
+        self.assertIn(
+            "self.req_to_token_pool = dense_backend.req_to_token_pool",
+            init_source,
+        )
+
     def test_npu_sparse_prefill_avoids_metadata_item_syncs(self):
         source = _read("python/sglang/srt/layers/attention/minimax_sparse_backend.py")
         tree = ast.parse(source)

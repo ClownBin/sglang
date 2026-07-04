@@ -3,15 +3,19 @@ import re
 import unittest
 from pathlib import Path
 
-from sglang.test.ci.ci_register import register_cpu_ci
+try:
+    from sglang.test.ci.ci_register import register_cpu_ci
+except ModuleNotFoundError:
+    register_cpu_ci = None
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+if register_cpu_ci is not None:
+    register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
 def _read(path: str) -> str:
-    return (REPO_ROOT / path).read_text()
+    return (REPO_ROOT / path).read_text(encoding="utf-8")
 
 
 class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
@@ -68,6 +72,68 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
         self.assertIn("is_npu", source)
         self.assertIn("_raise_npu_sparse_not_ready", source)
         self.assertRegex(source, r"self\.is_npu\s*=\s*is_npu\(\)")
+
+    def test_minimax_hybrid_backend_exposes_pool_refs_for_tbo(self):
+        source = _read("python/sglang/srt/layers/attention/minimax_sparse_backend.py")
+        tree = ast.parse(source)
+        hybrid_class = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == "MiniMaxHybridAttnBackend"
+        )
+        init_fn = next(
+            node
+            for node in hybrid_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+        )
+        init_source = ast.get_source_segment(source, init_fn)
+
+        self.assertIn(
+            "self.token_to_kv_pool = dense_backend.token_to_kv_pool",
+            init_source,
+        )
+        self.assertIn(
+            "self.req_to_token_pool = dense_backend.req_to_token_pool",
+            init_source,
+        )
+
+    def test_npu_sparse_prefill_avoids_metadata_item_syncs(self):
+        source = _read("python/sglang/srt/layers/attention/minimax_sparse_backend.py")
+        tree = ast.parse(source)
+        prefill = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_forward_npu_sparse_prefill"
+        )
+        forbidden_metadata = (
+            "req_pool_indices",
+            "cu_seqlens",
+            "seq_lens",
+            "prefix_lens",
+        )
+
+        item_sources = []
+        for node in ast.walk(prefill):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "item"
+            ):
+                item_sources.append(ast.get_source_segment(source, node.func.value))
+
+        offending = [
+            item_source
+            for item_source in item_sources
+            if item_source is not None
+            and any(name in item_source for name in forbidden_metadata)
+        ]
+        self.assertEqual(
+            offending,
+            [],
+            "NPU sparse prefill should use CPU metadata instead of per-request "
+            ".item() syncs for batch lengths/indices.",
+        )
 
     def test_swigluoai_has_npu_eager_path(self):
         source = _read("python/sglang/srt/models/minimax_m3.py")
@@ -163,6 +229,193 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
             r"x\.shape\[-1\]\s*>\s*_NPU_GEMMA_RMS_NORM_TRITON_MAX_HIDDEN_SIZE",
             "MiniMax-M3 hidden_size=6144 must avoid the fused Triton residual kernel.",
         )
+
+    def test_minimax_m3_exposes_tbo_operation_contracts(self):
+        source = _read("python/sglang/srt/models/minimax_m3.py")
+        tree = ast.parse(source)
+        classes = {
+            node.name: node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)
+        }
+
+        attention_methods = {
+            node.name
+            for node in classes["MiniMaxM3Attention"].body
+            if isinstance(node, ast.FunctionDef)
+        }
+        moe_methods = {
+            node.name
+            for node in classes["MiniMaxM3MoE"].body
+            if isinstance(node, ast.FunctionDef)
+        }
+        decoder_methods = {
+            node.name
+            for node in classes["MiniMaxM3DecoderLayer"].body
+            if isinstance(node, ast.FunctionDef)
+        }
+
+        self.assertIn("op_prepare", attention_methods)
+        self.assertIn("op_core", attention_methods)
+        self.assertTrue(
+            {
+                "op_gate",
+                "op_select_experts",
+                "op_dispatch_a",
+                "op_dispatch_b",
+                "op_experts",
+                "op_combine_a",
+                "op_combine_b",
+                "op_shared_experts",
+                "op_output",
+            }.issubset(moe_methods)
+        )
+        self.assertTrue(
+            {
+                "op_comm_prepare_attn",
+                "op_comm_prepare_mlp",
+                "op_comm_postprocess_layer",
+            }.issubset(decoder_methods)
+        )
+
+    def test_minimax_m3_attention_core_handles_empty_tbo_subbatch(self):
+        source = _read("python/sglang/srt/models/minimax_m3.py")
+        tree = ast.parse(source)
+        attention_class = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == "MiniMaxM3Attention"
+        )
+        forward_core = next(
+            node
+            for node in attention_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "forward_core"
+        )
+        forward_core_source = ast.get_source_segment(source, forward_core)
+
+        self.assertRegex(
+            forward_core_source,
+            r"if\s+inner_state\s+is\s+None:\s*\n\s+return\s+hidden_states",
+            "TBO runs attention op_core for every subbatch; empty subbatches must "
+            "short-circuit before sparse attention unpacking.",
+        )
+
+    def test_minimax_m3_registered_in_tbo_strategy(self):
+        source = _read("python/sglang/srt/batch_overlap/operations_strategy.py")
+
+        self.assertIn('layer_name == "MiniMaxM3DecoderLayer"', source)
+        self.assertIn("_compute_moe_minimax_m3_layer_operations_strategy_tbo", source)
+        self.assertIn("_compute_moe_minimax_m3_prefill", source)
+        self.assertIn("_compute_moe_minimax_m3_decode", source)
+
+    def test_minimax_m3_tbo_runs_dense_prefix_before_sparse_suffix(self):
+        source = _read("python/sglang/srt/models/minimax_m3.py")
+        tree = ast.parse(source)
+        model_class = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == "MiniMaxM3Model"
+        )
+        forward = next(
+            node
+            for node in model_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "forward"
+        )
+        forward_source = ast.get_source_segment(source, forward)
+
+        self.assertIn("normal_start_layer = self.start_layer", forward_source)
+        self.assertIn("normal_end_layer = self.end_layer", forward_source)
+        self.assertIn("range(normal_start_layer, normal_end_layer)", forward_source)
+        self.assertIn("if normal_end_layer != self.end_layer:", forward_source)
+        self.assertIn(
+            "layers=self.layers[normal_end_layer : self.end_layer]",
+            forward_source,
+        )
+        self.assertRegex(
+            forward_source,
+            r"self\.layers\[\s*normal_end_layer\s*-\s*1\s*\]\.layer_scatter_modes\.layer_output_mode",
+        )
+        self.assertNotIn("layers=self.layers,", forward_source)
+
+    def test_minimax_m3_tbo_strategy_avoids_cuda_sms_on_npu_path(self):
+        source = _read("python/sglang/srt/batch_overlap/operations_strategy.py")
+        tree = ast.parse(source)
+        prefill = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_compute_moe_minimax_m3_prefill"
+        )
+        prefill_source = ast.get_source_segment(source, prefill)
+
+        self.assertNotIn("torch.cuda", prefill_source)
+        self.assertNotIn("get_device_properties", prefill_source)
+        self.assertNotIn("DeepEPConfig.get_instance", prefill_source)
+        self.assertRegex(prefill_source, r"deep_gemm_num_sms\s*=\s*None")
+
+    def test_minimax_m3_tbo_strategy_preserves_semantic_op_order(self):
+        source = _read("python/sglang/srt/batch_overlap/operations_strategy.py")
+        tree = ast.parse(source)
+
+        def function_source(name):
+            function = next(
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.FunctionDef) and node.name == name
+            )
+            return ast.get_source_segment(source, function)
+
+        def assert_order(function_body, ordered_fragments):
+            indexes = [function_body.index(fragment) for fragment in ordered_fragments]
+            self.assertEqual(indexes, sorted(indexes), ordered_fragments)
+
+        for function_name in (
+            "_compute_moe_minimax_m3_prefill",
+            "_compute_moe_minimax_m3_decode",
+        ):
+            body = function_source(function_name)
+            assert_order(
+                body,
+                [
+                    "layer.op_comm_prepare_attn",
+                    "layer.self_attn.op_prepare",
+                    "layer.self_attn.op_core",
+                    "layer.op_comm_prepare_mlp",
+                    "layer.mlp.op_gate",
+                    "layer.mlp.op_select_experts",
+                    "layer.mlp.op_dispatch_a",
+                    "layer.mlp.op_shared_experts",
+                    "layer.mlp.op_dispatch_b",
+                    "layer.mlp.op_experts",
+                    "layer.mlp.op_combine_a",
+                    "layer.mlp.op_combine_b",
+                    "layer.mlp.op_output",
+                    "layer.op_comm_postprocess_layer",
+                ],
+            )
+
+    def test_minimax_m3_tbo_moe_ops_reuse_forward_deepep_math(self):
+        source = _read("python/sglang/srt/models/minimax_m3.py")
+        tree = ast.parse(source)
+        moe_class = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == "MiniMaxM3MoE"
+        )
+        op_sources = {
+            node.name: ast.get_source_segment(source, node)
+            for node in moe_class.body
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("op_")
+        }
+
+        self.assertIn("_compute_router_logits", op_sources["op_gate"])
+        self.assertIn("num_token_non_padded", op_sources["op_select_experts"])
+        self.assertIn(
+            "ExpertLocationDispatchInfo.init_new",
+            op_sources["op_select_experts"],
+        )
+        self.assertIn("_forward_shared_experts", op_sources["op_shared_experts"])
+        self.assertIn("run_moe_core", op_sources["op_experts"])
+        self.assertIn("combine_b", op_sources["op_combine_b"])
+        self.assertIn("hidden_states + shared_output", op_sources["op_output"])
 
 
 if __name__ == "__main__":

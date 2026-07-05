@@ -1362,6 +1362,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     if self._vdiff_count < 8:
                         self._vdiff_count += 1
                         try:
+                            prefill_meta = self._build_npu_sparse_prefill_meta(
+                                forward_batch, cu_seqlens, seq_lens, prefix_lens
+                            )
                             idx_o, o = self._forward_npu_sparse_prefill(
                                 q,
                                 k_cache,
@@ -1373,6 +1376,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                                 cu_seqlens,
                                 seq_lens,
                                 prefix_lens,
+                                prefill_meta,
                             )
                             _d = (o_t.float() - o.float()).abs().max().item()
                             _r = _d / max(o.float().abs().max().item(), 1e-6)

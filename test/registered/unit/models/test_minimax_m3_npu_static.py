@@ -135,6 +135,29 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
             ".item() syncs for batch lengths/indices.",
         )
 
+    def test_npu_sparse_prefill_callers_pass_prefill_meta(self):
+        source = _read("python/sglang/srt/layers/attention/minimax_sparse_backend.py")
+        tree = ast.parse(source)
+        forward_extend = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "forward_extend"
+        )
+
+        prefill_calls = [
+            node
+            for node in ast.walk(forward_extend)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_forward_npu_sparse_prefill"
+        ]
+
+        self.assertGreaterEqual(len(prefill_calls), 1)
+        self.assertTrue(
+            all(len(call.args) == 11 for call in prefill_calls),
+            "Every NPU sparse prefill call should pass precomputed prefill_meta.",
+        )
+
     def test_swigluoai_has_npu_eager_path(self):
         source = _read("python/sglang/srt/models/minimax_m3.py")
         tree = ast.parse(source)

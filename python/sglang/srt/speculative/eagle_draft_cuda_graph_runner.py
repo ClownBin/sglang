@@ -373,6 +373,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             draft_probs=draft_probs,
             hidden_states=hidden_states,
             capture_hidden_mode=capture_mode,
+            num_tokens_per_req=self.num_tokens_per_bs,
+            num_tokens_for_logprob_per_req=self.num_tokens_per_bs,
         )
 
         sampling_info = SamplingBatchInfo(

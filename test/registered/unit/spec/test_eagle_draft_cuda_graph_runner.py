@@ -243,6 +243,35 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
                 f"{rel_path} capture ForwardBatch must include CPU DP token counts.",
             )
 
+    def test_draft_capture_sets_spec_token_coefficients(self):
+        source = (
+            REPO_ROOT / "python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py"
+        ).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        class_node = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef)
+            and node.name == "EAGLEDraftCudaGraphRunner"
+        )
+        capture_one_shape = next(
+            node
+            for node in class_node.body
+            if isinstance(node, ast.FunctionDef) and node.name == "capture_one_shape"
+        )
+        draft_input_calls = [
+            node
+            for node in ast.walk(capture_one_shape)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "EagleDraftInput"
+        ]
+
+        self.assertEqual(len(draft_input_calls), 1)
+        keyword_names = {kw.arg for kw in draft_input_calls[0].keywords}
+        self.assertIn("num_tokens_per_req", keyword_names)
+        self.assertIn("num_tokens_for_logprob_per_req", keyword_names)
+
 
 if __name__ == "__main__":
     unittest.main()

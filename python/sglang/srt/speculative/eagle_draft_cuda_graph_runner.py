@@ -414,6 +414,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             sampling_info=sampling_info,
             rids_int=rids_int,
             bootstrap_room_ids_int=bootstrap_room_ids_int,
+            lora_ids=[None] * num_seqs,
             capture_hidden_mode=(
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             ),

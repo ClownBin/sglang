@@ -243,34 +243,85 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
                 f"{rel_path} capture ForwardBatch must include CPU DP token counts.",
             )
 
-    def test_draft_capture_sets_spec_token_coefficients(self):
-        source = (
-            REPO_ROOT / "python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py"
-        ).read_text(encoding="utf-8")
-        tree = ast.parse(source)
-        class_node = next(
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.ClassDef)
-            and node.name == "EAGLEDraftCudaGraphRunner"
-        )
-        capture_one_shape = next(
-            node
-            for node in class_node.body
-            if isinstance(node, ast.FunctionDef) and node.name == "capture_one_shape"
-        )
-        draft_input_calls = [
-            node
-            for node in ast.walk(capture_one_shape)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "EagleDraftInput"
-        ]
+    def test_capture_forward_batches_keep_host_metadata_for_padding(self):
+        # ForwardBatch.init_new always supplies lora_ids from ScheduleBatch.reqs.
+        # EAGLE capture builds fake ForwardBatch objects by hand; DP MLP-sync
+        # padding still expects the same host metadata shape when it pads rows.
+        for rel_path, class_name in (
+            (
+                "python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py",
+                "EAGLEDraftCudaGraphRunner",
+            ),
+            (
+                "python/sglang/srt/speculative/eagle_draft_extend_cuda_graph_runner.py",
+                "EAGLEDraftExtendCudaGraphRunner",
+            ),
+        ):
+            source = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
+            tree = ast.parse(source)
+            class_node = next(
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.ClassDef) and node.name == class_name
+            )
+            capture_one_shape = next(
+                node
+                for node in class_node.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "capture_one_shape"
+            )
+            forward_batch_calls = [
+                node
+                for node in ast.walk(capture_one_shape)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "ForwardBatch"
+            ]
 
-        self.assertEqual(len(draft_input_calls), 1)
-        keyword_names = {kw.arg for kw in draft_input_calls[0].keywords}
-        self.assertIn("num_tokens_per_req", keyword_names)
-        self.assertIn("num_tokens_for_logprob_per_req", keyword_names)
+            self.assertEqual(len(forward_batch_calls), 1, rel_path)
+            keyword_names = {kw.arg for kw in forward_batch_calls[0].keywords}
+            self.assertIn("lora_ids", keyword_names, rel_path)
+
+    def test_capture_sets_spec_token_coefficients(self):
+        for rel_path, class_name, input_class_name in (
+            (
+                "python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py",
+                "EAGLEDraftCudaGraphRunner",
+                "EagleDraftInput",
+            ),
+            (
+                "python/sglang/srt/speculative/eagle_draft_extend_cuda_graph_runner.py",
+                "EAGLEDraftExtendCudaGraphRunner",
+                "EagleDraftExtendInput",
+            ),
+        ):
+            source = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
+            tree = ast.parse(source)
+            class_node = next(
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.ClassDef) and node.name == class_name
+            )
+            capture_one_shape = next(
+                node
+                for node in class_node.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "capture_one_shape"
+            )
+            draft_input_calls = [
+                node
+                for node in ast.walk(capture_one_shape)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == input_class_name
+            ]
+
+            self.assertEqual(len(draft_input_calls), 1, rel_path)
+            keyword_names = {kw.arg for kw in draft_input_calls[0].keywords}
+            self.assertIn("num_tokens_per_req", keyword_names, rel_path)
+            self.assertIn(
+                "num_tokens_for_logprob_per_req", keyword_names, rel_path
+            )
 
 
 if __name__ == "__main__":

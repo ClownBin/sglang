@@ -362,6 +362,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             num_accept_tokens=num_accept_tokens,
             # Padded tree width per req; drives the constant qo layout.
             num_tokens_per_req=self.num_tokens_per_bs,
+            num_tokens_for_logprob_per_req=self.num_tokens_per_bs,
         )
 
         forward_batch = ForwardBatch(
@@ -387,6 +388,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             global_dp_buffer_len=global_dp_buffer_len,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
+            lora_ids=[None] * bs,
             capture_hidden_mode=CaptureHiddenMode.LAST,
             padded_static_len=self.padded_static_len,
         )

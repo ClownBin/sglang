@@ -242,3 +242,61 @@ def test_target_verify_uses_seq_lens_as_prefix_for_triton_verify():
     assert captured["topk_seq_lens"] == expected_lens
     assert captured["sparse_seq_lens"] == expected_lens
     assert captured["block_table_shape"] == (12, 32)
+
+
+def test_npu_sparse_prefill_uses_out_cache_loc_for_current_extend_chunk():
+    module = _load_minimax_sparse_backend_module()
+    backend = module.MiniMaxSparseAttnBackend.__new__(module.MiniMaxSparseAttnBackend)
+    backend.req_to_token = torch.tensor([[2, 3, 999, 999]], dtype=torch.long)
+
+    captured = {}
+
+    def fake_sparse_seq(
+        self,
+        q_seq,
+        k_seq,
+        v_seq,
+        idx_q_seq,
+        idx_k_seq,
+        idx_v_seq,
+        query_positions,
+        seq_len,
+    ):
+        captured["k_locs"] = k_seq[:, 0, 0].to(torch.long).tolist()
+        captured["v_locs"] = v_seq[:, 0, 0].to(torch.long).tolist()
+        captured["idx_k_locs"] = idx_k_seq[:, 0].to(torch.long).tolist()
+        captured["query_positions"] = query_positions.to(torch.long).tolist()
+        captured["seq_len"] = seq_len
+        return None, torch.full_like(q_seq, 7.0)
+
+    backend._npu_sparse_seq = types.MethodType(fake_sparse_seq, backend)
+
+    forward_batch = types.SimpleNamespace(
+        out_cache_loc=torch.tensor([6, 7], dtype=torch.long),
+    )
+    q = torch.zeros((2, 1, 1), dtype=torch.float32)
+    k_cache = torch.arange(10, dtype=torch.float32).view(10, 1, 1)
+    v_cache = torch.arange(10, dtype=torch.float32).view(10, 1, 1)
+    idx_q = torch.zeros((2, 1, 1), dtype=torch.float32)
+    idx_k_cache = torch.arange(10, dtype=torch.float32).view(10, 1, 1)
+
+    _, out = backend._forward_npu_sparse_prefill(
+        q,
+        k_cache,
+        v_cache,
+        idx_q,
+        idx_k_cache,
+        None,
+        forward_batch,
+        torch.tensor([0, 2], dtype=torch.int32),
+        torch.tensor([4], dtype=torch.int32),
+        torch.tensor([2], dtype=torch.int32),
+        ([0], [(0, 2)], [4], [2]),
+    )
+
+    assert captured["k_locs"] == [2, 3, 6, 7]
+    assert captured["v_locs"] == [2, 3, 6, 7]
+    assert captured["idx_k_locs"] == [2, 3, 6, 7]
+    assert captured["query_positions"] == [2, 3]
+    assert captured["seq_len"] == 4
+    torch.testing.assert_close(out, torch.full_like(q, 7.0))

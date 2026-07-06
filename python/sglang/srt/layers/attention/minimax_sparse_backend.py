@@ -715,6 +715,35 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             )
         return idx_out, out
 
+    def _build_npu_sparse_prefill_locs(
+        self,
+        forward_batch: ForwardBatch,
+        req_idx: int,
+        q_start: int,
+        q_end: int,
+        prefix_len: int,
+        total_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        prefix_len = max(0, prefix_len)
+        out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+
+        if out_cache_loc is None or q_end > int(out_cache_loc.shape[0]):
+            return self.req_to_token[req_idx, :total_len].to(
+                device=device, dtype=torch.long
+            )
+
+        if prefix_len > 0:
+            prefix_locs = self.req_to_token[req_idx, :prefix_len].to(
+                device=device, dtype=torch.long
+            )
+            current_locs = out_cache_loc[q_start:q_end].to(
+                device=device, dtype=torch.long
+            )
+            return torch.cat([prefix_locs, current_locs], dim=0)
+
+        return out_cache_loc[q_start:q_end].to(device=device, dtype=torch.long)
+
     def _forward_npu_sparse_prefill(
         self,
         q: torch.Tensor,
@@ -761,18 +790,24 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             prefix_len = prefix_lens_cpu[batch_id]
             total_len = seq_lens_cpu[batch_id]
             q_len = q_end - q_start
-            locs = self.req_to_token[req_idx, :total_len].to(
-                device=k_slots.device, dtype=torch.long
+            locs = self._build_npu_sparse_prefill_locs(
+                forward_batch,
+                req_idx,
+                q_start,
+                q_end,
+                prefix_len,
+                total_len,
+                k_slots.device,
             )
+            kv_len = int(locs.shape[0])
             # Fast path: NPU ``index_select`` on the paged KV pool is
             # pathologically slow here (~33 ms/call, ~90% of prefill time).
-            # Prefill slots are handed out as a contiguous run by the token
-            # pool, so when ``locs`` is contiguous a direct slice (a zero-copy
-            # view) replaces the scattered gather and the GatherV3 cost
-            # vanishes. Fall back to index_select for fragmented allocations.
-            is_contig = total_len <= 1 or bool((locs[1:] - locs[:-1] == 1).all().item())
+            # Current extend slots are already available as out_cache_loc; using
+            # them directly avoids depending on a just-written req_to_token suffix
+            # before sparse prefill gathers from the KV pool on NPU.
+            is_contig = kv_len <= 1 or bool((locs[1:] - locs[:-1] == 1).all().item())
             if is_contig:
-                sl = slice(int(locs[0].item()), int(locs[0].item()) + total_len)
+                sl = slice(int(locs[0].item()), int(locs[0].item()) + kv_len)
                 k_seq = k_slots[sl]
                 v_seq = v_slots[sl]
                 idx_k_seq = idx_k_slots[sl, 0, :]
@@ -798,7 +833,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_k_seq,
                 idx_v_seq,
                 query_positions,
-                total_len,
+                kv_len,
             )
             out[q_start:q_end] = o_seq
             if idx_out is not None:

@@ -307,6 +307,39 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         self.assertIn("self.global_num_tokens_for_logprob_cpu", body)
         self.assertIn("self.global_num_tokens_for_logprob_gpu.copy_", body)
 
+    def test_mlp_sync_post_forward_restores_padded_draft_fields(self):
+        # EAGLE draft capture reuses one ForwardBatch across multiple draft
+        # steps. DP MLP-sync padding must therefore restore any field that can
+        # be copied by the eager input registry before the next step reuses it.
+        source = (
+            REPO_ROOT / "python/sglang/srt/model_executor/forward_batch_info.py"
+        ).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        class_node = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == "ForwardBatch"
+        )
+        post_forward = next(
+            node
+            for node in class_node.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "post_forward_mlp_sync_batch"
+        )
+        body = ast.get_source_segment(source, post_forward)
+
+        self.assertIn("self.input_ids = self.input_ids[:num_tokens]", body)
+        self.assertIn(
+            "self.mrope_positions = self.mrope_positions[:, :num_tokens]",
+            body,
+        )
+        self.assertIn("self.lora_ids = self.lora_ids[:bs]", body)
+        self.assertIn("self.rids_int = self.rids_int[:bs]", body)
+        self.assertIn(
+            "self.bootstrap_room_ids_int = self.bootstrap_room_ids_int[:bs]",
+            body,
+        )
+
     def test_capture_sets_spec_token_coefficients(self):
         for rel_path, class_name, input_class_name in (
             (

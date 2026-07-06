@@ -1403,11 +1403,52 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self.spec_info is not None:
             if self.forward_mode.is_decode():  # draft
                 num_tokens = self.hidden_states_backup.shape[0]
+                if self.input_ids is not None:
+                    self.input_ids = self.input_ids[:num_tokens]
                 self.positions = self.positions[:num_tokens]
+                if self.mrope_positions is not None:
+                    self.mrope_positions = self.mrope_positions[:, :num_tokens]
                 self.seq_lens = self.seq_lens[:bs]
+                if self.encoder_lens is not None:
+                    self.encoder_lens = self.encoder_lens[:bs]
                 self.req_pool_indices = self.req_pool_indices[:bs]
                 if self.seq_lens_cpu is not None:
                     self.seq_lens_cpu = self.seq_lens_cpu[:bs]
+                if self.lora_ids is not None:
+                    self.lora_ids = self.lora_ids[:bs]
+                if self.extend_seq_lens is not None:
+                    self.extend_seq_lens = self.extend_seq_lens[:bs]
+                if self.extend_seq_lens_cpu is not None:
+                    self.extend_seq_lens_cpu = self.extend_seq_lens_cpu[:bs]
+                if self.mamba_track_indices is not None:
+                    self.mamba_track_indices = self.mamba_track_indices[:bs]
+                if self.mamba_track_mask is not None:
+                    self.mamba_track_mask = self.mamba_track_mask[:bs]
+                if self.mamba_track_seqlens is not None:
+                    self.mamba_track_seqlens = self.mamba_track_seqlens[:bs]
+                if self.rids_int is not None:
+                    self.rids_int = self.rids_int[:bs]
+                    if self.sampling_info is not None:
+                        self.sampling_info.rids_int = self.rids_int
+                if self.bootstrap_room_ids_int is not None:
+                    self.bootstrap_room_ids_int = self.bootstrap_room_ids_int[:bs]
+                    if self.sampling_info is not None:
+                        self.sampling_info.bootstrap_room_ids_int = (
+                            self.bootstrap_room_ids_int
+                        )
+                if getattr(self.spec_info, "topk_p", None) is not None:
+                    self.spec_info.topk_p = self.spec_info.topk_p[:bs]
+                if getattr(self.spec_info, "topk_index", None) is not None:
+                    self.spec_info.topk_index = self.spec_info.topk_index[:bs]
+                if getattr(self.spec_info, "draft_probs", None) is not None:
+                    self.spec_info.draft_probs = self.spec_info.draft_probs[:bs]
+                if getattr(self.spec_info, "num_correct_drafts", None) is not None:
+                    self.spec_info.num_correct_drafts = (
+                        self.spec_info.num_correct_drafts[:bs]
+                    )
+                    self.spec_info.num_accept_tokens = (
+                        self.spec_info.num_accept_tokens[:bs]
+                    )
                 logits_output.next_token_logits = logits_output.next_token_logits[
                     :num_tokens
                 ]

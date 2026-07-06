@@ -1139,6 +1139,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         self._original_batch_size = self.batch_size
         global_num_tokens = self.global_num_tokens_cpu
+        global_num_tokens_for_logprob = self.global_num_tokens_for_logprob_cpu
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_parallel().attn_tp_size
 
@@ -1168,6 +1169,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # reduce-scatter instead of all-reduce after MLP.
             max_num_tokens = max(global_num_tokens)
             global_num_tokens = [max_num_tokens] * sync_group_size
+            global_num_tokens_for_logprob = global_num_tokens
             buffer_len = max_num_tokens * sync_group_size
         else:
             buffer_len = sum(global_num_tokens)
@@ -1265,8 +1267,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # padding
         self._pad_inputs_to_size(model_runner, num_tokens, bs)
         self.global_num_tokens_cpu = global_num_tokens
+        self.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
         global_num_tokens_pinned = torch.tensor(global_num_tokens, pin_memory=True)
         self.global_num_tokens_gpu.copy_(global_num_tokens_pinned, non_blocking=True)
+        global_num_tokens_for_logprob_pinned = torch.tensor(
+            global_num_tokens_for_logprob, pin_memory=True
+        )
+        self.global_num_tokens_for_logprob_gpu.copy_(
+            global_num_tokens_for_logprob_pinned, non_blocking=True
+        )
 
         TboForwardBatchPreparer.prepare(
             batch=self, is_draft_worker=model_runner.is_draft_worker

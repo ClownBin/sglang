@@ -282,6 +282,31 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
             keyword_names = {kw.arg for kw in forward_batch_calls[0].keywords}
             self.assertIn("lora_ids", keyword_names, rel_path)
 
+    def test_mlp_sync_keeps_logprob_token_counts_in_max_len_mode(self):
+        # Under MAX_LEN DP padding, logits gather uses all_gather and therefore
+        # needs the logprob token-count tensor to describe the padded local
+        # hidden-state length, not the pre-padding real-token length.
+        source = (
+            REPO_ROOT / "python/sglang/srt/model_executor/forward_batch_info.py"
+        ).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        class_node = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == "ForwardBatch"
+        )
+        prepare_mlp_sync_batch = next(
+            node
+            for node in class_node.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "prepare_mlp_sync_batch"
+        )
+        body = ast.get_source_segment(source, prepare_mlp_sync_batch)
+
+        self.assertIn("global_num_tokens_for_logprob = global_num_tokens", body)
+        self.assertIn("self.global_num_tokens_for_logprob_cpu", body)
+        self.assertIn("self.global_num_tokens_for_logprob_gpu.copy_", body)
+
     def test_capture_sets_spec_token_coefficients(self):
         for rel_path, class_name, input_class_name in (
             (

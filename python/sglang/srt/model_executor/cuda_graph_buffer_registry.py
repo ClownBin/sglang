@@ -42,8 +42,11 @@ _has_foreach_copy = hasattr(torch, "_foreach_copy_")
 
 
 def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
-    """Call torch._foreach_copy_ grouped by (dst_dtype, src_dtype) pairs
-    (a single foreach call requires a uniform dtype pair)."""
+    """Call torch._foreach_copy_ grouped by dtype and shape.
+
+    Some backends (notably NPU) require every tensor in a foreach copy call to
+    have the same shape, even when each dst/src pair is individually compatible.
+    """
 
     def _foreach_copy(
         group_dsts: List[torch.Tensor], group_srcs: List[torch.Tensor]
@@ -54,9 +57,12 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
             for dst, src in zip(group_dsts, group_srcs):
                 dst.copy_(src)
 
-    groups: Dict[Tuple[torch.dtype, torch.dtype], Tuple[List, List]] = {}
+    groups: Dict[
+        Tuple[torch.dtype, torch.dtype, Tuple[int, ...], Tuple[int, ...]],
+        Tuple[List, List],
+    ] = {}
     for dst, src in zip(dsts, srcs):
-        key = (dst.dtype, src.dtype)
+        key = (dst.dtype, src.dtype, tuple(dst.shape), tuple(src.shape))
         if key not in groups:
             groups[key] = ([], [])
         groups[key][0].append(dst)

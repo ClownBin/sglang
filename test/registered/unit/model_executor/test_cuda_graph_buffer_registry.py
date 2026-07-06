@@ -25,6 +25,7 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     GraphSlot,
     PaddingPolicy,
+    _grouped_foreach_copy_,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -168,6 +169,43 @@ class TestRegistryRegister(unittest.TestCase):
         )
         self.assertEqual(slot.buffer.device.type, "cpu")
         self.assertEqual(int(slot.buffer[0].item()), 11)
+
+
+class TestGroupedForeachCopy(unittest.TestCase):
+    def test_groups_by_shape_for_strict_foreach_backends(self):
+        old_foreach_copy = torch._foreach_copy_
+        calls = []
+
+        def strict_foreach_copy(dsts, srcs):
+            dst_shapes = {tuple(dst.shape) for dst in dsts}
+            src_shapes = {tuple(src.shape) for src in srcs}
+            if len(dst_shapes) != 1 or len(src_shapes) != 1:
+                raise RuntimeError("mixed shapes in one foreach copy")
+            calls.append((tuple(dsts[0].shape), len(dsts)))
+            for dst, src in zip(dsts, srcs):
+                dst.copy_(src)
+
+        torch._foreach_copy_ = strict_foreach_copy
+        try:
+            dsts = [
+                torch.zeros(4, dtype=torch.int64),
+                torch.zeros(8, dtype=torch.int64),
+                torch.zeros(4, dtype=torch.int64),
+            ]
+            srcs = [
+                torch.ones(4, dtype=torch.int64),
+                torch.ones(8, dtype=torch.int64) * 2,
+                torch.ones(4, dtype=torch.int64) * 3,
+            ]
+
+            _grouped_foreach_copy_(dsts, srcs)
+        finally:
+            torch._foreach_copy_ = old_foreach_copy
+
+        self.assertEqual(calls, [((4,), 2), ((8,), 1)])
+        self.assertTrue(torch.equal(dsts[0], srcs[0]))
+        self.assertTrue(torch.equal(dsts[1], srcs[1]))
+        self.assertTrue(torch.equal(dsts[2], srcs[2]))
 
 
 class TestFillFromAndExtract(unittest.TestCase):

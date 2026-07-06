@@ -32,13 +32,15 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.model_executor.graph_buffer_copy import (
+    GraphBufferCopyEntry,
+    GraphBufferCopyPlanner,
+    _grouped_foreach_copy_,
+)
 from sglang.srt.model_executor.input_buffers import share_input_buffer
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-
-
-_has_foreach_copy = hasattr(torch, "_foreach_copy_")
 
 
 def _slice_src_to_dst_shape(
@@ -59,66 +61,6 @@ def _slice_src_to_dst_shape(
             f"to larger dst shape {tuple(dst.shape)}."
         )
     return src[tuple(slice(0, dst_size) for dst_size in dst.shape)]
-
-
-def _should_use_foreach_copy(group_dsts: List[torch.Tensor]) -> bool:
-    if not _has_foreach_copy:
-        return False
-    return bool(group_dsts) and group_dsts[0].device.type != "npu"
-
-
-def _grouped_foreach_copy_(
-    dsts: List[torch.Tensor],
-    srcs: List[torch.Tensor],
-    names: Optional[List[str]] = None,
-) -> None:
-    """Call torch._foreach_copy_ grouped by dtype and shape.
-
-    Some backends (notably NPU) require every tensor in a foreach copy call to
-    have the same shape, even when each dst/src pair is individually compatible.
-    """
-
-    def _foreach_copy(
-        group_dsts: List[torch.Tensor],
-        group_srcs: List[torch.Tensor],
-        group_names: List[str],
-    ) -> None:
-        if _should_use_foreach_copy(group_dsts):
-            try:
-                torch._foreach_copy_(group_dsts, group_srcs)
-            except RuntimeError as e:
-                raise RuntimeError(
-                    "foreach copy failed for slots "
-                    f"{group_names}: dst shapes "
-                    f"{[tuple(dst.shape) for dst in group_dsts]}, src shapes "
-                    f"{[tuple(src.shape) for src in group_srcs]}"
-                ) from e
-        else:
-            for name, dst, src in zip(group_names, group_dsts, group_srcs):
-                try:
-                    dst.copy_(src)
-                except RuntimeError as e:
-                    raise RuntimeError(
-                        f"copy failed for slot {name!r}: "
-                        f"dst shape={tuple(dst.shape)}, stride={tuple(dst.stride())}; "
-                        f"src shape={tuple(src.shape)}, stride={tuple(src.stride())}"
-                    ) from e
-
-    groups: Dict[
-        Tuple[torch.dtype, torch.dtype, Tuple[int, ...], Tuple[int, ...]],
-        Tuple[List, List, List],
-    ] = {}
-    if names is None:
-        names = ["<unnamed>"] * len(dsts)
-    for name, dst, src in zip(names, dsts, srcs):
-        key = (dst.dtype, src.dtype, tuple(dst.shape), tuple(src.shape))
-        if key not in groups:
-            groups[key] = ([], [], [])
-        groups[key][0].append(dst)
-        groups[key][1].append(src)
-        groups[key][2].append(name)
-    for group_dsts, group_srcs, group_names in groups.values():
-        _foreach_copy(group_dsts, group_srcs, group_names)
 
 
 class PaddingPolicy(Enum):
@@ -361,6 +303,7 @@ class CudaGraphBufferRegistry:
         # when allocating (bind/source bypasses the pool).
         self.share_pool = share_pool
         self._slots: Dict[str, GraphSlot] = {}
+        self._copy_planner = GraphBufferCopyPlanner()
 
     # ---- registration ------------------------------------------------------
 
@@ -475,12 +418,7 @@ class CudaGraphBufferRegistry:
             slot.reset_padding(raw_n, padded_n)
 
         # Phase 2: collect (dst, src) pairs and dispatch a grouped copy.
-        gpu_dsts: List[torch.Tensor] = []
-        gpu_srcs: List[torch.Tensor] = []
-        gpu_names: List[str] = []
-        cpu_dsts: List[torch.Tensor] = []
-        cpu_srcs: List[torch.Tensor] = []
-        cpu_names: List[str] = []
+        copy_entries: List[GraphBufferCopyEntry] = []
         for slot in self._slots.values():
             if not slot.enabled or slot.buffer is None or not slot.copy_from_fb:
                 continue
@@ -510,27 +448,8 @@ class CudaGraphBufferRegistry:
                     dst = slot.buffer[:raw_n]
                     src = src[:raw_n]
             src = _slice_src_to_dst_shape(src, dst, slot.name)
-            # foreach_copy_ requires same-device tensors per call — bucket
-            # by device.
-            if dst.device.type == "cpu":
-                cpu_dsts.append(dst)
-                cpu_srcs.append(src)
-                cpu_names.append(slot.name)
-            else:
-                gpu_dsts.append(dst)
-                gpu_srcs.append(src)
-                gpu_names.append(slot.name)
-        if gpu_dsts:
-            _grouped_foreach_copy_(gpu_dsts, gpu_srcs, gpu_names)
-        for name, dst, src in zip(cpu_names, cpu_dsts, cpu_srcs):
-            try:
-                dst.copy_(src)
-            except RuntimeError as e:
-                raise RuntimeError(
-                    f"copy failed for slot {name!r}: "
-                    f"dst shape={tuple(dst.shape)}, stride={tuple(dst.stride())}; "
-                    f"src shape={tuple(src.shape)}, stride={tuple(src.stride())}"
-                ) from e
+            copy_entries.append(GraphBufferCopyEntry(name=slot.name, dst=dst, src=src))
+        self._copy_planner.copy(copy_entries)
 
         # Phase 3: post-fill hooks (compute-then-write slots).
         for slot in self._slots.values():

@@ -15,6 +15,7 @@ context.
 """
 
 import dataclasses
+import os
 import unittest
 from types import SimpleNamespace
 from typing import Optional
@@ -25,9 +26,9 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     GraphSlot,
     PaddingPolicy,
-    _grouped_foreach_copy_,
 )
-import sglang.srt.model_executor.cuda_graph_buffer_registry as registry_mod
+from sglang.srt.model_executor.graph_buffer_copy import _grouped_foreach_copy_
+import sglang.srt.model_executor.graph_buffer_copy as copy_mod
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -173,6 +174,20 @@ class TestRegistryRegister(unittest.TestCase):
 
 
 class TestGroupedForeachCopy(unittest.TestCase):
+    def _set_foreach_env(self, value: Optional[str]):
+        old_value = os.environ.get("SGLANG_NPU_GRAPH_COPY_FOREACH")
+        if value is None:
+            os.environ.pop("SGLANG_NPU_GRAPH_COPY_FOREACH", None)
+        else:
+            os.environ["SGLANG_NPU_GRAPH_COPY_FOREACH"] = value
+        return old_value
+
+    def _restore_foreach_env(self, old_value: Optional[str]):
+        if old_value is None:
+            os.environ.pop("SGLANG_NPU_GRAPH_COPY_FOREACH", None)
+        else:
+            os.environ["SGLANG_NPU_GRAPH_COPY_FOREACH"] = old_value
+
     def test_groups_by_shape_for_strict_foreach_backends(self):
         old_foreach_copy = torch._foreach_copy_
         calls = []
@@ -209,14 +224,18 @@ class TestGroupedForeachCopy(unittest.TestCase):
         self.assertTrue(torch.equal(dsts[2], srcs[2]))
 
     def test_fallback_copy_does_not_call_foreach(self):
-        old_should_use_foreach_copy = registry_mod._should_use_foreach_copy
+        old_should_use_foreach_copy = (
+            copy_mod.GraphBufferCopyPlanner._should_use_foreach_copy
+        )
         old_foreach_copy = torch._foreach_copy_
         calls = []
 
         def fail_foreach_copy(_dsts, _srcs):
             raise AssertionError("foreach copy should not be called")
 
-        registry_mod._should_use_foreach_copy = lambda _dsts: False
+        copy_mod.GraphBufferCopyPlanner._should_use_foreach_copy = (
+            lambda _self, _entries: False
+        )
         torch._foreach_copy_ = fail_foreach_copy
         try:
             dsts = [
@@ -230,12 +249,92 @@ class TestGroupedForeachCopy(unittest.TestCase):
             _grouped_foreach_copy_(dsts, srcs)
             calls.append("fallback")
         finally:
-            registry_mod._should_use_foreach_copy = old_should_use_foreach_copy
+            copy_mod.GraphBufferCopyPlanner._should_use_foreach_copy = (
+                old_should_use_foreach_copy
+            )
             torch._foreach_copy_ = old_foreach_copy
 
         self.assertEqual(calls, ["fallback"])
         self.assertTrue(torch.equal(dsts[0], srcs[0]))
         self.assertTrue(torch.equal(dsts[1], srcs[1]))
+
+    def test_npu_shape_safe_group_uses_foreach_in_on_mode(self):
+        old_env = self._set_foreach_env("on")
+        old_tensor_device_type = copy_mod._tensor_device_type
+        old_probe = copy_mod._probe_npu_foreach_copy
+        old_foreach_copy = torch._foreach_copy_
+        calls = []
+
+        def foreach_copy(dsts, srcs):
+            calls.append(len(dsts))
+            for dst, src in zip(dsts, srcs):
+                dst.copy_(src)
+
+        copy_mod._tensor_device_type = lambda _tensor: "npu"
+        copy_mod._probe_npu_foreach_copy = lambda _device: True
+        torch._foreach_copy_ = foreach_copy
+        try:
+            dsts = [torch.zeros(4, dtype=torch.int64) for _ in range(2)]
+            srcs = [torch.ones(4, dtype=torch.int64) * i for i in (1, 2)]
+
+            _grouped_foreach_copy_(dsts, srcs, ["a", "b"])
+        finally:
+            copy_mod._tensor_device_type = old_tensor_device_type
+            copy_mod._probe_npu_foreach_copy = old_probe
+            torch._foreach_copy_ = old_foreach_copy
+            self._restore_foreach_env(old_env)
+
+        self.assertEqual(calls, [2])
+        self.assertTrue(torch.equal(dsts[0], srcs[0]))
+        self.assertTrue(torch.equal(dsts[1], srcs[1]))
+
+    def test_npu_stride_unsafe_group_uses_single_copy_in_on_mode(self):
+        old_env = self._set_foreach_env("on")
+        old_tensor_device_type = copy_mod._tensor_device_type
+        old_probe = copy_mod._probe_npu_foreach_copy
+        old_foreach_copy = torch._foreach_copy_
+
+        def fail_foreach_copy(_dsts, _srcs):
+            raise AssertionError("stride-unsafe NPU group must not use foreach copy")
+
+        copy_mod._tensor_device_type = lambda _tensor: "npu"
+        copy_mod._probe_npu_foreach_copy = lambda _device: True
+        torch._foreach_copy_ = fail_foreach_copy
+        try:
+            dst_base = torch.zeros(2, 4, dtype=torch.int64)
+            src_base = torch.arange(8, dtype=torch.int64).reshape(2, 4)
+            dsts = [dst_base[:, :2], torch.zeros(2, 2, dtype=torch.int64)]
+            srcs = [src_base[:, :2], torch.ones(2, 2, dtype=torch.int64)]
+
+            _grouped_foreach_copy_(dsts, srcs, ["non_contig", "contig"])
+        finally:
+            copy_mod._tensor_device_type = old_tensor_device_type
+            copy_mod._probe_npu_foreach_copy = old_probe
+            torch._foreach_copy_ = old_foreach_copy
+            self._restore_foreach_env(old_env)
+
+        self.assertTrue(torch.equal(dsts[0], srcs[0]))
+        self.assertTrue(torch.equal(dsts[1], srcs[1]))
+
+    def test_npu_on_mode_probe_failure_is_fail_fast(self):
+        old_env = self._set_foreach_env("on")
+        old_tensor_device_type = copy_mod._tensor_device_type
+        old_probe = copy_mod._probe_npu_foreach_copy
+
+        copy_mod._tensor_device_type = lambda _tensor: "npu"
+        copy_mod._probe_npu_foreach_copy = lambda _device: False
+        try:
+            dsts = [torch.zeros(4, dtype=torch.int64) for _ in range(2)]
+            srcs = [torch.ones(4, dtype=torch.int64) for _ in range(2)]
+
+            with self.assertRaisesRegex(
+                RuntimeError, "SGLANG_NPU_GRAPH_COPY_FOREACH=on"
+            ):
+                _grouped_foreach_copy_(dsts, srcs, ["a", "b"])
+        finally:
+            copy_mod._tensor_device_type = old_tensor_device_type
+            copy_mod._probe_npu_foreach_copy = old_probe
+            self._restore_foreach_env(old_env)
 
 
 class TestFillFromAndExtract(unittest.TestCase):

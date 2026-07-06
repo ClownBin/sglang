@@ -368,6 +368,41 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         assert prefix_lens_cpu is not None
         return req_indices, q_ranges, seq_lens_cpu, prefix_lens_cpu
 
+    def _ensure_target_verify_extend_metadata(
+        self, forward_batch: ForwardBatch, num_tokens: int
+    ) -> None:
+        batch_size = int(forward_batch.seq_lens.shape[0])
+        ndt = int(
+            self.speculative_num_draft_tokens or (int(num_tokens) // max(batch_size, 1))
+        )
+
+        if forward_batch.extend_seq_lens is None:
+            forward_batch.extend_seq_lens = torch.full(
+                (batch_size,),
+                ndt,
+                dtype=torch.int32,
+                device=forward_batch.seq_lens.device,
+            )
+        if getattr(forward_batch, "extend_seq_lens_cpu", None) is None:
+            forward_batch.extend_seq_lens_cpu = [ndt] * batch_size
+
+        if getattr(forward_batch, "extend_prefix_lens", None) is None:
+            forward_batch.extend_prefix_lens = (
+                forward_batch.seq_lens.to(torch.int32).clamp(min=0)
+            )
+        if getattr(forward_batch, "extend_prefix_lens_cpu", None) is None:
+            prefix_lens_cpu = self._cpu_int_list(
+                getattr(forward_batch, "seq_lens_cpu", None), batch_size
+            )
+            if prefix_lens_cpu is None and forward_batch.seq_lens.device.type == "cpu":
+                prefix_lens_cpu = self._cpu_int_list(
+                    forward_batch.seq_lens, batch_size
+                )
+            if prefix_lens_cpu is not None:
+                forward_batch.extend_prefix_lens_cpu = [
+                    max(0, int(prefix_len)) for prefix_len in prefix_lens_cpu
+                ]
+
     def _merge_sparse_blocks(
         self,
         topk_blocks: torch.Tensor,
@@ -1102,12 +1137,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             )
 
         # Per-query CAUSAL seq_lens + req_pool_indices (device ops, no host-sync).
-        # forward_batch.seq_lens[req] = prefix + ndt (set by the TARGET_VERIFY
-        # branch of forward_extend); prefix = seq_lens - ndt. Query j of a request
-        # (0-indexed) sits at sequence position prefix + j and causally attends to
-        # KV[0 : prefix + j + 1], so its seq_len = prefix + j + 1. repeat_interleave
-        # maps each request's ndt flattened queries back to its req_pool_indices.
-        prefix = (forward_batch.seq_lens.to(torch.long) - int(ndt)).clamp(min=0)
+        # EAGLE target verify keeps forward_batch.seq_lens as the cached prefix
+        # before draft tokens are written. Query j of a request (0-indexed) sits at
+        # sequence position prefix + j and causally attends to
+        # KV[0 : prefix + j + 1], so its seq_len = prefix + j + 1.
+        prefix = forward_batch.seq_lens.to(torch.long).clamp(min=0)
         offsets = torch.arange(
             1, int(ndt) + 1, device=q.device, dtype=torch.long
         )  # [ndt] = 1..ndt
@@ -1269,30 +1303,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             idx_k_cache, idx_v_cache = self.kv_pool.get_index_kv_buffer(layer.layer_id)
 
         if forward_batch.extend_seq_lens is None:
-            # TARGET_VERIFY: ForwardBatch leaves extend_seq_lens(_cpu) None (it
-            # only populates seq_lens = prefix + draft); each sequence verifies
-            # `speculative_num_draft_tokens` draft tokens (see ascend_backend
-            # forward_metadata). Reconstruct per-seq extend lengths so the sparse
-            # prefill kernel receives correct cu_seqlens instead of crashing on
-            # the None .device access.
-            _bs = forward_batch.seq_lens.shape[0]
-            _ndt = self.speculative_num_draft_tokens or (q.shape[0] // max(_bs, 1))
-            forward_batch.extend_seq_lens = torch.full(
-                (_bs,),
-                int(_ndt),
-                dtype=torch.int32,
-                device=forward_batch.seq_lens.device,
-            )
-            forward_batch.extend_seq_lens_cpu = [int(_ndt)] * _bs
-            # For TARGET_VERIFY, seq_lens = prefix + ndt (draft tokens are added to
-            # KV during verify); the cached prefix per seq is seq_lens - ndt. The
-            # default ``prefix_lens = 0`` branch below is wrong for verify and makes
-            # the sparse block selection / positions read garbage, so materialize
-            # extend_prefix_lens here.
-            if forward_batch.extend_prefix_lens is None:
-                forward_batch.extend_prefix_lens = (
-                    forward_batch.seq_lens.to(torch.int32) - int(_ndt)
-                ).clamp(min=0)
+            # TARGET_VERIFY leaves extend_seq_lens(_cpu) None while seq_lens stays
+            # as the cached prefix before draft tokens are written. Reconstruct the
+            # per-request draft length and prefix so sparse verify uses the same KV
+            # boundary convention as dense Ascend forward_mtp.
+            self._ensure_target_verify_extend_metadata(forward_batch, q.shape[0])
 
         cu_seqlens = torch.cat(
             [

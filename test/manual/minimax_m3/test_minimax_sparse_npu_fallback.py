@@ -18,6 +18,9 @@ def _install_fake_modules():
         "sglang.srt.layers.attention.minimax_sparse_ops",
         "sglang.srt.layers.attention.minimax_sparse_ops.common",
         "sglang.srt.layers.attention.minimax_sparse_ops.common.index",
+        "sglang.srt.layers.attention.minimax_sparse_ops.npu_triton",
+        "sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.flash_block_score_decode",
+        "sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.topk_sparse_decode",
         "sglang.srt.mem_cache",
         "sglang.srt.mem_cache.memory_pool",
         "sglang.srt.model_executor",
@@ -69,7 +72,7 @@ def _install_fake_modules():
 def _load_minimax_sparse_backend_module():
     _install_fake_modules()
     module_path = (
-        Path(__file__).resolve().parents[2]
+        Path(__file__).resolve().parents[3]
         / "python/sglang/srt/layers/attention/minimax_sparse_backend.py"
     )
     spec = importlib.util.spec_from_file_location(
@@ -137,3 +140,105 @@ def test_npu_sparse_seq_matches_dense_attention_when_all_blocks_are_selected():
     expected = torch.einsum("qhk,khd->qhd", probs.to(v_seq.dtype), v_seq)
 
     torch.testing.assert_close(out.float(), expected.float(), rtol=1e-3, atol=1e-3)
+
+
+def test_target_verify_uses_seq_lens_as_prefix_for_triton_verify():
+    module = _load_minimax_sparse_backend_module()
+    backend = module.MiniMaxSparseAttnBackend.__new__(module.MiniMaxSparseAttnBackend)
+    backend.page_size = 128
+    backend.block_size_k = 128
+    backend.topk_blocks = 1
+    backend.init_blocks = 0
+    backend.local_blocks = 0
+    backend.score_type = "max"
+    backend.speculative_num_draft_tokens = 4
+    backend._max_seqlen_k = 4096
+    backend.max_context_len = 4096
+    backend.req_to_token = torch.stack(
+        [
+            torch.arange(4096, dtype=torch.long),
+            torch.arange(4096, dtype=torch.long),
+            torch.zeros(4096, dtype=torch.long),
+        ]
+    )
+    backend._verify_diag_logged = True
+
+    captured = {}
+
+    flash_mod = sys.modules[
+        "sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.flash_block_score_decode"
+    ]
+    sparse_mod = sys.modules[
+        "sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.topk_sparse_decode"
+    ]
+
+    def fake_topk(*, q, block_table, seq_lens, topk, **_kwargs):
+        captured["topk_seq_lens"] = seq_lens.cpu().tolist()
+        captured["block_table_shape"] = tuple(block_table.shape)
+        return (
+            torch.zeros_like(q),
+            torch.zeros((q.shape[1], q.shape[0], topk), dtype=torch.int32),
+        )
+
+    def fake_sparse(*, q, seq_lens, **_kwargs):
+        captured["sparse_seq_lens"] = seq_lens.cpu().tolist()
+        return torch.zeros_like(q)
+
+    flash_mod.flash_decode_bnsd_with_topk_idx = fake_topk
+    sparse_mod.flash_decode_bnsd_with_gqa_share_sparse = fake_sparse
+
+    forward_batch = types.SimpleNamespace(
+        seq_lens=torch.tensor([3500, 3510, 0], dtype=torch.int64),
+        req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int64),
+        extend_seq_lens=None,
+        extend_seq_lens_cpu=None,
+        extend_prefix_lens=None,
+        extend_prefix_lens_cpu=None,
+    )
+
+    q = torch.zeros((12, 1, 2), dtype=torch.float32)
+    k_cache = torch.zeros((4096, 1, 2), dtype=torch.float32)
+    v_cache = torch.zeros((4096, 1, 2), dtype=torch.float32)
+    idx_q = torch.zeros((12, 1, 2), dtype=torch.float32)
+    idx_k_cache = torch.zeros((4096, 1, 2), dtype=torch.float32)
+
+    backend._ensure_target_verify_extend_metadata(forward_batch, q.shape[0])
+    torch.testing.assert_close(
+        forward_batch.extend_seq_lens,
+        torch.tensor([4, 4, 4], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        forward_batch.extend_prefix_lens,
+        torch.tensor([3500, 3510, 0], dtype=torch.int32),
+    )
+    assert forward_batch.extend_seq_lens_cpu == [4, 4, 4]
+    assert forward_batch.extend_prefix_lens_cpu == [3500, 3510, 0]
+
+    backend._forward_npu_triton_verify(
+        q,
+        k_cache,
+        v_cache,
+        idx_q,
+        idx_k_cache,
+        None,
+        forward_batch,
+        forward_batch.extend_prefix_lens,
+    )
+
+    expected_lens = [
+        3501,
+        3502,
+        3503,
+        3504,
+        3511,
+        3512,
+        3513,
+        3514,
+        1,
+        2,
+        3,
+        4,
+    ]
+    assert captured["topk_seq_lens"] == expected_lens
+    assert captured["sparse_seq_lens"] == expected_lens
+    assert captured["block_table_shape"] == (12, 32)

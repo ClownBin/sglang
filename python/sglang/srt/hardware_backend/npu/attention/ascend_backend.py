@@ -24,6 +24,7 @@ from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
+from sglang.srt.mem_cache.block_table import build_extend_block_table_token_slots
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -380,6 +381,58 @@ class AscendAttnBackend(AttentionBackend):
         v = layer.v_head_dim
         return (d == v and d in (128, 192, 256)) or (d == 192 and v == 128)
 
+    def _get_extend_lens_for_block_table(
+        self,
+        forward_mode: ForwardMode,
+        seq_lens: torch.Tensor,
+        extend_prefix_lens: Optional[torch.Tensor],
+        extend_seq_lens: Optional[torch.Tensor],
+        out_cache_loc: Optional[torch.Tensor],
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if out_cache_loc is None:
+            return None, None
+
+        if forward_mode.is_target_verify():
+            return seq_lens, torch.full_like(
+                seq_lens, self.speculative_num_draft_tokens
+            )
+
+        if (
+            forward_mode.is_extend()
+            and extend_prefix_lens is not None
+            and extend_seq_lens is not None
+        ):
+            return extend_prefix_lens, extend_seq_lens
+
+        return None, None
+
+    def _build_block_table_token_slots(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        forward_mode: ForwardMode,
+        max_len: int,
+        out_cache_loc: Optional[torch.Tensor],
+        extend_prefix_lens: Optional[torch.Tensor] = None,
+        extend_seq_lens: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        prefix_lens, current_extend_lens = self._get_extend_lens_for_block_table(
+            forward_mode,
+            seq_lens,
+            extend_prefix_lens,
+            extend_seq_lens,
+            out_cache_loc,
+        )
+        return build_extend_block_table_token_slots(
+            req_to_token=self.req_to_token,
+            req_pool_indices=req_pool_indices,
+            max_len=max_len,
+            page_size=self.page_size,
+            prefix_lens=prefix_lens,
+            extend_lens=current_extend_lens,
+            out_cache_loc=out_cache_loc,
+        )
+
     def get_verify_buffers_to_fill_after_draft(self):
         """
         Return buffers for verify attention kernels that needs to be filled after draft.
@@ -418,6 +471,8 @@ class AscendAttnBackend(AttentionBackend):
             forward_mode=forward_batch.forward_mode,
             spec_info=forward_batch.spec_info,
             out_cache_loc=forward_batch.out_cache_loc,
+            extend_prefix_lens=forward_batch.extend_prefix_lens,
+            extend_seq_lens=forward_batch.extend_seq_lens,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -431,20 +486,23 @@ class AscendAttnBackend(AttentionBackend):
             and forward_batch.spec_info is not None
         ):
             seq_lens_max += self.speculative_step_id + 1
-        self.forward_metadata.block_tables = (
-            self.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices, :seq_lens_max
-            ][:, :: self.page_size]
-            // self.page_size
+        max_len = int(seq_lens_max.item())
+        block_table_token_slots = self._build_block_table_token_slots(
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            forward_batch.forward_mode,
+            max_len,
+            forward_batch.out_cache_loc,
+            forward_batch.extend_prefix_lens,
+            forward_batch.extend_seq_lens,
         )
+        self.forward_metadata.block_tables = block_table_token_slots // self.page_size
         if self.is_hybrid_swa:
             self.forward_metadata.block_tables_swa = (
                 (
                     self.full_to_swa_index_mapping[
-                        self.req_to_token_pool.req_to_token[
-                            forward_batch.req_pool_indices, :seq_lens_max
-                        ]
-                    ][:, :: self.page_size]
+                        block_table_token_slots
+                    ]
                     // self.page_size
                 )
                 .to(torch.int32)
@@ -642,6 +700,8 @@ class AscendAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         out_cache_loc: Optional[torch.Tensor] = None,
+        extend_prefix_lens: Optional[torch.Tensor] = None,
+        extend_seq_lens: Optional[torch.Tensor] = None,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
@@ -662,12 +722,19 @@ class AscendAttnBackend(AttentionBackend):
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             max_len += self.speculative_step_id + 1
         max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+        block_table_token_slots = self._build_block_table_token_slots(
+            req_pool_indices[:bs],
+            seq_lens[:bs],
+            forward_mode,
+            max_len,
+            out_cache_loc,
+            None if extend_prefix_lens is None else extend_prefix_lens[:bs],
+            None if extend_seq_lens is None else extend_seq_lens[:bs],
+        )
 
         if self.is_hybrid_swa:
             metadata.block_tables_swa[:bs, :max_seq_pages].copy_(
-                self.full_to_swa_index_mapping[
-                    self.req_to_token[req_pool_indices[:bs], :max_len]
-                ][:, :: self.page_size]
+                self.full_to_swa_index_mapping[block_table_token_slots]
                 // self.page_size
             )
             metadata.block_tables_swa[:bs, max_seq_pages:].fill_(0)
@@ -685,8 +752,7 @@ class AscendAttnBackend(AttentionBackend):
             metadata.swa_mask[:bs, 0, :].copy_(mask)
             metadata.swa_mask[bs:, :, :].fill_(True)
         metadata.block_tables[:bs, :max_seq_pages].copy_(
-            self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
-            // self.page_size
+            block_table_token_slots // self.page_size
         )
 
         metadata.block_tables[:bs, max_seq_pages:].fill_(0)

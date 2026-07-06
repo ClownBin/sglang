@@ -27,6 +27,7 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     PaddingPolicy,
     _grouped_foreach_copy_,
 )
+import sglang.srt.model_executor.cuda_graph_buffer_registry as registry_mod
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -206,6 +207,35 @@ class TestGroupedForeachCopy(unittest.TestCase):
         self.assertTrue(torch.equal(dsts[0], srcs[0]))
         self.assertTrue(torch.equal(dsts[1], srcs[1]))
         self.assertTrue(torch.equal(dsts[2], srcs[2]))
+
+    def test_fallback_copy_does_not_call_foreach(self):
+        old_should_use_foreach_copy = registry_mod._should_use_foreach_copy
+        old_foreach_copy = torch._foreach_copy_
+        calls = []
+
+        def fail_foreach_copy(_dsts, _srcs):
+            raise AssertionError("foreach copy should not be called")
+
+        registry_mod._should_use_foreach_copy = lambda _dsts: False
+        torch._foreach_copy_ = fail_foreach_copy
+        try:
+            dsts = [
+                torch.zeros(4, dtype=torch.int64),
+                torch.zeros(8, dtype=torch.int64),
+            ]
+            srcs = [
+                torch.ones(4, dtype=torch.int64),
+                torch.ones(8, dtype=torch.int64) * 2,
+            ]
+            _grouped_foreach_copy_(dsts, srcs)
+            calls.append("fallback")
+        finally:
+            registry_mod._should_use_foreach_copy = old_should_use_foreach_copy
+            torch._foreach_copy_ = old_foreach_copy
+
+        self.assertEqual(calls, ["fallback"])
+        self.assertTrue(torch.equal(dsts[0], srcs[0]))
+        self.assertTrue(torch.equal(dsts[1], srcs[1]))
 
 
 class TestFillFromAndExtract(unittest.TestCase):

@@ -41,6 +41,12 @@ if TYPE_CHECKING:
 _has_foreach_copy = hasattr(torch, "_foreach_copy_")
 
 
+def _should_use_foreach_copy(group_dsts: List[torch.Tensor]) -> bool:
+    if not _has_foreach_copy:
+        return False
+    return bool(group_dsts) and group_dsts[0].device.type != "npu"
+
+
 def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
     """Call torch._foreach_copy_ grouped by dtype and shape.
 
@@ -51,7 +57,7 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
     def _foreach_copy(
         group_dsts: List[torch.Tensor], group_srcs: List[torch.Tensor]
     ) -> None:
-        if _has_foreach_copy:
+        if _should_use_foreach_copy(group_dsts):
             torch._foreach_copy_(group_dsts, group_srcs)
         else:
             for dst, src in zip(group_dsts, group_srcs):

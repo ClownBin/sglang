@@ -305,7 +305,8 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
 
         self.assertIn("global_num_tokens_for_logprob = global_num_tokens", body)
         self.assertIn("self.global_num_tokens_for_logprob_cpu", body)
-        self.assertIn("self.global_num_tokens_for_logprob_gpu.copy_", body)
+        self.assertIn("_copy_global_num_tokens_to_gpu(", body)
+        self.assertNotIn("torch.tensor(global_num_tokens, pin_memory=True)", body)
 
     def test_mlp_sync_post_forward_restores_padded_draft_fields(self):
         # EAGLE draft capture reuses one ForwardBatch across multiple draft

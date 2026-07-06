@@ -75,6 +75,29 @@ _skip_attn_backend_init_warned = False
 _is_npu = is_npu()
 
 
+def _copy_global_num_tokens_to_gpu(dst: torch.Tensor, values: List[int]) -> None:
+    if not values:
+        return
+
+    values = [int(value) for value in values]
+    if all(value == values[0] for value in values):
+        dst.fill_(values[0])
+        return
+
+    if _is_npu and torch.npu.is_current_stream_capturing():
+        raise RuntimeError(
+            "NPU graph capture does not support non-uniform global token count "
+            f"host-to-device updates: {values}"
+        )
+
+    values_tensor = torch.tensor(
+        values,
+        dtype=dst.dtype,
+        pin_memory=is_pin_memory_available(),
+    )
+    dst.copy_(values_tensor, non_blocking=True)
+
+
 class ForwardMode(IntEnum):
     # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
     # It is also called "prefill" in common terminology.
@@ -1268,13 +1291,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self._pad_inputs_to_size(model_runner, num_tokens, bs)
         self.global_num_tokens_cpu = global_num_tokens
         self.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
-        global_num_tokens_pinned = torch.tensor(global_num_tokens, pin_memory=True)
-        self.global_num_tokens_gpu.copy_(global_num_tokens_pinned, non_blocking=True)
-        global_num_tokens_for_logprob_pinned = torch.tensor(
-            global_num_tokens_for_logprob, pin_memory=True
-        )
-        self.global_num_tokens_for_logprob_gpu.copy_(
-            global_num_tokens_for_logprob_pinned, non_blocking=True
+        _copy_global_num_tokens_to_gpu(self.global_num_tokens_gpu, global_num_tokens)
+        _copy_global_num_tokens_to_gpu(
+            self.global_num_tokens_for_logprob_gpu, global_num_tokens_for_logprob
         )
 
         TboForwardBatchPreparer.prepare(

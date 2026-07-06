@@ -14,7 +14,9 @@ so it must stay consistent with the padded ``seq_lens`` they are handed -- and
 the raw value must be restored once replay finishes.
 """
 
+import ast
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -30,6 +32,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 CAPTURE_BS = 4
 SEQ_LEN_FILL_VALUE = 1
 NUM_STEPS = 3
+REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
 class _RecordingDraftBackend:
@@ -192,6 +195,53 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         for observation in backend.observations:
             self.assertIsNone(observation.seq_lens_sum, msg=observation.phase)
         self.assertIsNone(forward_batch.seq_lens_sum)
+
+    def test_capture_forward_batches_keep_dp_token_counts_on_cpu(self):
+        # EAGLE draft capture calls ModelRunner.forward inside the captured
+        # function. Under DP attention, that path needs CPU-side global token
+        # counts to run the same MLP-sync padding as non-graph execution.
+        expected_keywords = {
+            "global_num_tokens_cpu",
+            "global_num_tokens_for_logprob_cpu",
+        }
+
+        for rel_path, class_name in (
+            (
+                "python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py",
+                "EAGLEDraftCudaGraphRunner",
+            ),
+            (
+                "python/sglang/srt/speculative/eagle_draft_extend_cuda_graph_runner.py",
+                "EAGLEDraftExtendCudaGraphRunner",
+            ),
+        ):
+            source = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
+            tree = ast.parse(source)
+            class_node = next(
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.ClassDef) and node.name == class_name
+            )
+            capture_one_shape = next(
+                node
+                for node in class_node.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "capture_one_shape"
+            )
+            forward_batch_calls = [
+                node
+                for node in ast.walk(capture_one_shape)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "ForwardBatch"
+            ]
+
+            self.assertEqual(len(forward_batch_calls), 1, rel_path)
+            keyword_names = {kw.arg for kw in forward_batch_calls[0].keywords}
+            self.assertTrue(
+                expected_keywords.issubset(keyword_names),
+                f"{rel_path} capture ForwardBatch must include CPU DP token counts.",
+            )
 
 
 if __name__ == "__main__":

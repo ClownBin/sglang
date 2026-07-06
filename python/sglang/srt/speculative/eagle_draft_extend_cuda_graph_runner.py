@@ -329,10 +329,13 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         if self.require_mlp_tp_gather:
             global_num_tokens_cpu = [num_tokens] * self.dp_size
+            global_num_tokens_for_logprob_cpu = [num_tokens] * self.dp_size
         elif self.require_attn_tp_gather:
             global_num_tokens_cpu = [num_tokens]
+            global_num_tokens_for_logprob_cpu = [num_tokens]
         else:
             global_num_tokens_cpu = None
+            global_num_tokens_for_logprob_cpu = None
 
         if global_num_tokens_cpu is not None:
             global_dp_buffer_len = sum(global_num_tokens_cpu)
@@ -378,6 +381,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             mrope_positions=mrope_positions,
             global_num_tokens_gpu=buffers.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
+            global_num_tokens_cpu=global_num_tokens_cpu,
+            global_num_tokens_for_logprob_cpu=global_num_tokens_for_logprob_cpu,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             global_dp_buffer_len=global_dp_buffer_len,
             spec_algorithm=self.model_runner.spec_algorithm,

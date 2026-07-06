@@ -49,6 +49,19 @@ MAMBA_STATE_PER_REQ_NO_CACHE = 1
 logger = logging.getLogger(__name__)
 
 
+def use_triton_req_to_token_writer(attention_backend: str) -> bool:
+    # The generic Triton writer can leave NPU/Ascend readers observing stale or
+    # uninitialized req_to_token entries under overlap scheduling. Route that
+    # backend to the NPU shape-safe writer instead.
+    return support_triton(attention_backend) and not (
+        _is_npu and attention_backend == "ascend"
+    )
+
+
+def use_npu_shape_safe_req_to_token_writer(attention_backend: str) -> bool:
+    return _is_npu and attention_backend == "ascend"
+
+
 def kv_to_page_indices(kv_indices: np.ndarray, page_size: int):
     # The page is guaranteed to be full except the last page.
     if page_size == 1:
@@ -132,7 +145,8 @@ def write_cache_indices(
     prefix_tensors: list[torch.Tensor],
     req_to_token_pool: ReqToTokenPool,
 ):
-    if support_triton(get_global_server_args().attention_backend):
+    attention_backend = get_global_server_args().attention_backend
+    if use_triton_req_to_token_writer(attention_backend):
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
             dtype=torch.uint64,
@@ -148,6 +162,17 @@ def write_cache_indices(
             extend_lens_tensor,
             out_cache_loc,
             req_to_token_pool.req_to_token.shape[1],
+        )
+    elif use_npu_shape_safe_req_to_token_writer(attention_backend):
+        write_cache_indices_npu_shape_safe(
+            out_cache_loc,
+            req_pool_indices_tensor,
+            req_pool_indices_cpu,
+            prefix_lens_tensor,
+            prefix_lens_cpu,
+            extend_lens_tensor,
+            prefix_tensors,
+            req_to_token_pool,
         )
     else:
         pt = 0
@@ -166,6 +191,59 @@ def write_cache_indices(
                 out_cache_loc[pt : pt + extend_len],
             )
             pt += extend_len
+
+
+def write_cache_indices_npu_shape_safe(
+    out_cache_loc: torch.Tensor,
+    req_pool_indices_tensor: torch.Tensor,
+    req_pool_indices_cpu: torch.Tensor,
+    prefix_lens_tensor: torch.Tensor,
+    prefix_lens_cpu: torch.Tensor,
+    extend_lens_tensor: torch.Tensor,
+    prefix_tensors: list[torch.Tensor],
+    req_to_token_pool: ReqToTokenPool,
+):
+    for i in range(req_pool_indices_cpu.shape[0]):
+        prefix_len = prefix_lens_cpu[i].item()
+        if prefix_len == 0:
+            continue
+
+        req_to_token_pool.write(
+            (req_pool_indices_cpu[i].item(), slice(0, prefix_len)),
+            prefix_tensors[i],
+        )
+
+    num_extend_tokens = out_cache_loc.numel()
+    if num_extend_tokens == 0:
+        return
+
+    row_indices = torch.repeat_interleave(
+        req_pool_indices_tensor,
+        extend_lens_tensor,
+        output_size=num_extend_tokens,
+    )
+    prefix_lens = torch.repeat_interleave(
+        prefix_lens_tensor,
+        extend_lens_tensor,
+        output_size=num_extend_tokens,
+    )
+    extend_starts = torch.cumsum(extend_lens_tensor, dim=0) - extend_lens_tensor
+    extend_starts = torch.repeat_interleave(
+        extend_starts,
+        extend_lens_tensor,
+        output_size=num_extend_tokens,
+    )
+    token_offsets = torch.arange(
+        num_extend_tokens,
+        dtype=extend_lens_tensor.dtype,
+        device=out_cache_loc.device,
+    )
+    col_indices = prefix_lens + token_offsets - extend_starts
+
+    values = out_cache_loc
+    if values.dtype != req_to_token_pool.req_to_token.dtype:
+        values = values.to(req_to_token_pool.req_to_token.dtype)
+    req_to_token_pool.req_to_token[row_indices, col_indices] = values
 
 
 def get_last_loc(

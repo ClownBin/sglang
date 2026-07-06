@@ -445,10 +445,12 @@ class CudaGraphBufferRegistry:
                 raw_n = slot._raw_n(raw_bs, raw_num_tokens)
                 if slot.slice_fn is not None:
                     dst = slot.slice_fn(slot.buffer, raw_n)
+                    src = slot.slice_fn(src, raw_n)
                 elif slot.axis == "none":
                     dst = slot.buffer
                 else:
                     dst = slot.buffer[:raw_n]
+                    src = src[:raw_n]
             # foreach_copy_ requires same-device tensors per call — bucket
             # by device.
             if dst.device.type == "cpu":

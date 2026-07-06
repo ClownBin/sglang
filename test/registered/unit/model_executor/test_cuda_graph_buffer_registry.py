@@ -577,6 +577,49 @@ class TestSliceFnSlot(unittest.TestCase):
         )
         self.assertEqual(fb_view.mrope_positions.shape, (3, 8))
 
+    def test_fill_slices_padded_source_to_raw_tokens(self):
+        r = _make_registry(max_bs=4, max_num_tokens=8)
+        r.register_slot(
+            GraphSlot(
+                name="input_ids",
+                shape_fn=lambda bs, mt: (mt,),
+                dtype=torch.int64,
+                axis="tokens",
+            )
+        )
+        r.register_slot(
+            GraphSlot(
+                name="mrope_positions",
+                shape_fn=lambda bs, mt: (3, mt),
+                dtype=torch.int64,
+                axis="tokens",
+                slice_fn=lambda buf, n: buf[:, :n],
+            )
+        )
+        fb = _MiniForwardBatch(
+            batch_size=2,
+            input_ids=torch.arange(8, dtype=torch.int64),
+            mrope_positions=torch.arange(24, dtype=torch.int64).reshape(3, 8),
+        )
+
+        r.fill_from(
+            fb,
+            raw_bs=2,
+            padded_bs=2,
+            raw_num_tokens=4,
+            padded_num_tokens=4,
+        )
+
+        self.assertTrue(
+            torch.equal(r.get_slot("input_ids").buffer[:4], fb.input_ids[:4])
+        )
+        self.assertTrue(
+            torch.equal(
+                r.get_slot("mrope_positions").buffer[:, :4],
+                fb.mrope_positions[:, :4],
+            )
+        )
+
 
 class TestSourceFnSlots(unittest.TestCase):
     """``source_fn`` slots copy from a nested FB field or a side input, with a

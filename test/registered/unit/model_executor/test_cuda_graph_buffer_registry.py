@@ -1539,6 +1539,33 @@ class TestComputedSlots(unittest.TestCase):
             )
         )
 
+    def test_num_token_non_padded_scalar_copy_path(self):
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_decode_registry,
+        )
+
+        reg = build_decode_registry(
+            device=torch.device("cpu"),
+            max_bs=4,
+            max_num_token=8,
+            seq_len_fill_value=5,
+            cache_loc_dtype=torch.int64,
+            enable_num_token_non_padded=True,
+            require_gathered_buffer=False,
+        )
+        fb = _MiniForwardBatch(
+            batch_size=2,
+            num_token_non_padded=torch.tensor(7, dtype=torch.int32),
+        )
+        reg.fill_from(fb, raw_bs=2, padded_bs=2, raw_num_tokens=2, padded_num_tokens=2)
+
+        self.assertTrue(
+            torch.equal(
+                reg.get_slot("num_token_non_padded").buffer,
+                torch.tensor([7], dtype=torch.int32),
+            )
+        )
+
     def test_global_num_tokens_fill_path(self):
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
             build_decode_registry,

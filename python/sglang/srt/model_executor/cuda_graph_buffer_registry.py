@@ -46,6 +46,8 @@ def _slice_src_to_dst_shape(
 ) -> torch.Tensor:
     if tuple(src.shape) == tuple(dst.shape):
         return src
+    if src.numel() == dst.numel():
+        return src.reshape(dst.shape)
     if src.dim() != dst.dim():
         raise RuntimeError(
             f"GraphSlot {slot_name!r}: cannot copy src shape {tuple(src.shape)} "

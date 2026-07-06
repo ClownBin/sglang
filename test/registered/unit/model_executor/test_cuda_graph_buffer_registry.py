@@ -746,6 +746,34 @@ class TestSourceFnSlots(unittest.TestCase):
         r.fill_from(fb, raw_bs=3, padded_bs=8, raw_num_tokens=3, padded_num_tokens=16)
         self.assertTrue(torch.all(buf == 7))  # untouched
 
+    def test_source_fn_slices_oversized_source_to_buffer_shape(self):
+        r = _make_registry(max_bs=4, max_num_tokens=8)
+        r.register_slot(
+            GraphSlot(
+                name="ngram_embedding_info.column_starts",
+                shape_fn=lambda _bs, _mt: (4,),
+                dtype=torch.int32,
+                axis="none",
+                padding_policy=PaddingPolicy.KEEP_PAD,
+                source_fn=lambda fb, ctx: fb.ngram_embedding_info.column_starts,
+            )
+        )
+        fb = _MiniForwardBatch(
+            batch_size=4,
+            ngram_embedding_info=SimpleNamespace(
+                column_starts=torch.arange(8, dtype=torch.int32),
+            ),
+        )
+
+        r.fill_from(fb, raw_bs=4, padded_bs=4, raw_num_tokens=4, padded_num_tokens=4)
+
+        self.assertTrue(
+            torch.equal(
+                r.get_slot("ngram_embedding_info.column_starts").buffer,
+                torch.arange(4, dtype=torch.int32),
+            )
+        )
+
     def test_side_input_source_via_fill_context(self):
         r = _make_registry(max_bs=8, max_num_tokens=16)
         r.register_slot(

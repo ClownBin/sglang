@@ -133,6 +133,14 @@ class TboAttnBackend(AttentionBackend):
             assert ans == child.get_cuda_graph_seq_len_fill_value()
         return ans
 
+    def get_verify_buffers_to_fill_after_draft(self):
+        return self.primary.get_verify_buffers_to_fill_after_draft()
+
+    def update_verify_buffers_to_fill_after_draft(self, spec_info, cuda_graph_bs=None):
+        return self.primary.update_verify_buffers_to_fill_after_draft(
+            spec_info, cuda_graph_bs
+        )
+
     def forward(self, *args, **kwargs):
         return self.primary.forward(*args, **kwargs)
 

@@ -30,6 +30,44 @@ register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
 
 
+class _VerifyBufferBackend:
+    def __init__(self):
+        self.token_to_kv_pool = object()
+        self.req_to_token_pool = object()
+        self.mask_buf = object()
+        self.position_buf = object()
+        self.update_calls = []
+
+    def get_verify_buffers_to_fill_after_draft(self):
+        return [self.mask_buf, self.position_buf]
+
+    def update_verify_buffers_to_fill_after_draft(self, spec_info, cuda_graph_bs=None):
+        self.update_calls.append((spec_info, cuda_graph_bs))
+        return "updated"
+
+
+class TestTboAttnBackendDelegation(unittest.TestCase):
+    def test_verify_buffer_hooks_delegate_to_primary_backend(self):
+        primary = _VerifyBufferBackend()
+        children = [_VerifyBufferBackend(), _VerifyBufferBackend()]
+        wrapper = TboAttnBackend(primary=primary, children=children)
+
+        mask_buf, position_buf = wrapper.get_verify_buffers_to_fill_after_draft()
+        self.assertIs(mask_buf, primary.mask_buf)
+        self.assertIs(position_buf, primary.position_buf)
+
+        spec_info = object()
+        self.assertEqual(
+            wrapper.update_verify_buffers_to_fill_after_draft(
+                spec_info, cuda_graph_bs=8
+            ),
+            "updated",
+        )
+        self.assertEqual(primary.update_calls, [(spec_info, 8)])
+        self.assertEqual(children[0].update_calls, [])
+        self.assertEqual(children[1].update_calls, [])
+
+
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
 class TestTboAttnDenseAttentionBackendCorrectness(CustomTestCase):
     """Compose TboAttnBackend(primary=triton, children=[triton, triton]) and

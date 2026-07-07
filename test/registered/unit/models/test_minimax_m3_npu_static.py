@@ -192,6 +192,41 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
         self.assertIn("extend_prefix_lens_cpu=", body)
         self.assertIn("extend_seq_lens_cpu=", body)
 
+    def test_eagle_draft_extend_replay_views_carry_extend_metadata_for_ascend(self):
+        paths = [
+            "python/sglang/srt/speculative/eagle_draft_extend_cuda_graph_runner.py",
+            "python/sglang/srt/speculative/"
+            "multi_layer_eagle_draft_extend_cuda_graph_runner.py",
+        ]
+
+        for path in paths:
+            with self.subTest(path=path):
+                source = _read(path)
+                tree = ast.parse(source)
+                fb_view_assignments = [
+                    node
+                    for node in ast.walk(tree)
+                    if isinstance(node, ast.Assign)
+                    and any(
+                        isinstance(target, ast.Name) and target.id == "fb_view"
+                        for target in node.targets
+                    )
+                    and isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Name)
+                    and node.value.func.id == "SimpleNamespace"
+                ]
+
+                self.assertGreaterEqual(len(fb_view_assignments), 1)
+                for assignment in fb_view_assignments:
+                    body = ast.get_source_segment(source, assignment.value)
+                    for field in (
+                        "extend_prefix_lens=",
+                        "extend_seq_lens=",
+                        "extend_prefix_lens_cpu=",
+                        "extend_seq_lens_cpu=",
+                    ):
+                        self.assertIn(field, body)
+
     def test_swigluoai_has_npu_eager_path(self):
         source = _read("python/sglang/srt/models/minimax_m3.py")
         tree = ast.parse(source)

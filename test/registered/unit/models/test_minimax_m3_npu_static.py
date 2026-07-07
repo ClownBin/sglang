@@ -358,6 +358,39 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
         )
         self.assertNotIn("layers=self.layers,", forward_source)
 
+    def test_minimax_m3_tbo_keeps_eagle3_capture_layers_in_normal_prefix(self):
+        source = _read("python/sglang/srt/models/minimax_m3.py")
+        tree = ast.parse(source)
+        model_class = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == "MiniMaxM3Model"
+        )
+        helper = next(
+            (
+                node
+                for node in model_class.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "_compute_tbo_normal_end_layer"
+            ),
+            None,
+        )
+        self.assertIsNotNone(
+            helper,
+            "MiniMax-M3 TBO must compute its suffix boundary separately so "
+            "EAGLE3 aux hidden-state capture keeps the mtp_tmp_okay layer-loop "
+            "semantics before TBO takes over.",
+        )
+        helper_source = ast.get_source_segment(source, helper)
+
+        self.assertIn("last_capture_layer", helper_source)
+        self.assertIn('"_is_layer_to_capture"', helper_source)
+        self.assertIn("last_capture_layer + 1", helper_source)
+        self.assertRegex(
+            helper_source,
+            r"normal_end_layer\s*=\s*min\(\s*max\(self\.first_tbo_layer,\s*self\.start_layer\)",
+        )
+
     def test_minimax_m3_tbo_strategy_avoids_cuda_sms_on_npu_path(self):
         source = _read("python/sglang/srt/batch_overlap/operations_strategy.py")
         tree = ast.parse(source)

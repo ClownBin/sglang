@@ -227,6 +227,28 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
                     ):
                         self.assertIn(field, body)
 
+    def test_tbo_merge_length_uses_splitter_token_ranges_after_scatter(self):
+        source = _read("python/sglang/srt/batch_overlap/two_batch_overlap.py")
+        tree = ast.parse(source)
+        model_forward_tbo = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "_model_forward_tbo"
+        )
+        body = ast.get_source_segment(source, model_forward_tbo)
+
+        self.assertIn("_compute_tbo_merge_original_len(inputs_arr)", body)
+        self.assertNotIn('inputs["hidden_states"].shape[0]', body)
+
+        helper = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_compute_tbo_merge_original_len"
+        )
+        helper_source = ast.get_source_segment(source, helper)
+        self.assertIn("tbo_parent_token_range", helper_source)
+
     def test_swigluoai_has_npu_eager_path(self):
         source = _read("python/sglang/srt/models/minimax_m3.py")
         tree = ast.parse(source)

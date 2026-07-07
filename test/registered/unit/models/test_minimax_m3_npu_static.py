@@ -249,6 +249,22 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
         helper_source = ast.get_source_segment(source, helper)
         self.assertIn("tbo_parent_token_range", helper_source)
 
+    def test_tbo_child_replay_view_carries_extend_metadata_for_ascend(self):
+        source = _read("python/sglang/srt/layers/attention/tbo_backend.py")
+        tree = ast.parse(source)
+        helper = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_build_tbo_child_replay_fb_view"
+        )
+        body = ast.get_source_segment(source, helper)
+
+        self.assertIn("extend_prefix_lens=", body)
+        self.assertIn("extend_seq_lens=", body)
+        self.assertIn("extend_prefix_lens_cpu=", body)
+        self.assertIn("extend_seq_lens_cpu=", body)
+
     def test_swigluoai_has_npu_eager_path(self):
         source = _read("python/sglang/srt/models/minimax_m3.py")
         tree = ast.parse(source)

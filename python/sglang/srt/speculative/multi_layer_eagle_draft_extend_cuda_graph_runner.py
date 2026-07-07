@@ -412,6 +412,10 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             encoder_lens=None,
             # per-step write target; out_cache_loc is frozen at prepare() time.
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
+            extend_prefix_lens=None,
+            extend_seq_lens=buffers.extend_seq_lens[:bs],
+            extend_prefix_lens_cpu=None,
+            extend_seq_lens_cpu=self.extend_seq_lens_cpu[:bs],
             spec_info=spec_info,
         )
         self.eagle_worker.draft_extend_attn_backend_list[

@@ -575,6 +575,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             encoder_lens=None,
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
             out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
+            extend_prefix_lens=None,
+            extend_seq_lens=buffers.extend_seq_lens[:bs],
+            extend_prefix_lens_cpu=None,
+            extend_seq_lens_cpu=self.extend_seq_lens_cpu[:bs],
             spec_info=forward_batch.spec_info,
         )
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)

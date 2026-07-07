@@ -158,6 +158,45 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
             "Every NPU sparse prefill call should pass precomputed prefill_meta.",
         )
 
+    def test_minimax_sparse_target_verify_extends_kv_len_by_draft_tokens(self):
+        source = _read("python/sglang/srt/layers/attention/minimax_sparse_backend.py")
+        tree = ast.parse(source)
+        init_out_graph = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "init_forward_metadata_out_graph"
+        )
+        body = ast.get_source_segment(source, init_out_graph)
+
+        self.assertIn("seq_lens_max", body)
+        self.assertIn("forward_batch.forward_mode.is_target_verify()", body)
+        self.assertIn("self.speculative_num_draft_tokens", body)
+        self.assertRegex(
+            body,
+            r"seq_lens_max\s*\+=\s*int\(self\.speculative_num_draft_tokens or 0\)",
+            "MiniMax sparse TARGET_VERIFY block tables must include draft tokens "
+            "when computing max KV length.",
+        )
+
+    def test_minimax_sparse_npu_block_tables_overlay_current_extend_slots(self):
+        source = _read("python/sglang/srt/layers/attention/minimax_sparse_backend.py")
+        tree = ast.parse(source)
+        function_sources = {
+            node.name: ast.get_source_segment(source, node)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+
+        self.assertIn("build_extend_block_table_token_slots", source)
+        self.assertIn("_build_extend_block_table_token_slots", function_sources)
+        for name in ("_forward_npu_triton_verify", "_forward_npu_triton_prefill"):
+            with self.subTest(name=name):
+                self.assertIn(
+                    "_build_extend_block_table_token_slots",
+                    function_sources[name],
+                )
+
     def test_inner_fb_view_carries_extend_metadata_for_ascend_draft(self):
         source = _read("python/sglang/srt/model_executor/forward_batch_info.py")
         tree = ast.parse(source)

@@ -1767,6 +1767,19 @@ class MiniMaxM3Model(nn.Module):
             first_tbo_layer = layer_id
         return first_tbo_layer
 
+    def _compute_tbo_normal_end_layer(self) -> int:
+        normal_end_layer = min(
+            max(self.first_tbo_layer, self.start_layer), self.end_layer
+        )
+        last_capture_layer = None
+        for layer_id in range(self.start_layer, self.end_layer):
+            if getattr(self.layers[layer_id], "_is_layer_to_capture", False):
+                last_capture_layer = layer_id
+
+        if last_capture_layer is not None:
+            normal_end_layer = max(normal_end_layer, last_capture_layer + 1)
+        return min(normal_end_layer, self.end_layer)
+
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
 
@@ -1793,9 +1806,7 @@ class MiniMaxM3Model(nn.Module):
         normal_start_layer = self.start_layer
         normal_end_layer = self.end_layer
         if forward_batch.can_run_tbo:
-            normal_end_layer = min(
-                max(self.first_tbo_layer, normal_start_layer), normal_end_layer
-            )
+            normal_end_layer = self._compute_tbo_normal_end_layer()
 
         aux_hidden_states = []
         for i in range(normal_start_layer, normal_end_layer):

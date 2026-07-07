@@ -889,7 +889,7 @@ def _model_forward_tbo(
         input_data_scatter_mode=input_data_scatter_mode,
         layer_input_scatter_mode=layer_input_scatter_mode,
     )
-    original_hidden_states_len = inputs["hidden_states"].shape[0]
+    original_hidden_states_len = _compute_tbo_merge_original_len(inputs_arr)
     del inputs
 
     context = (
@@ -908,6 +908,13 @@ def _model_forward_tbo(
         )
 
     return _model_forward_tbo_merge_outputs(*outputs_arr, original_hidden_states_len)
+
+
+def _compute_tbo_merge_original_len(inputs_arr) -> int:
+    return max(
+        child_inputs["forward_batch"].tbo_parent_token_range[1]
+        for child_inputs in inputs_arr
+    )
 
 
 def _model_forward_non_tbo(inputs, operations_strategy: OperationsStrategy):

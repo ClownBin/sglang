@@ -354,6 +354,7 @@ def _build_qblock_mappings(
     page_size: int,
     max_blocks: int,
     device,
+    req_block_table: Optional[torch.Tensor] = None,
 ):
     """Precompute per-query-block varlen mappings (cheap PyTorch).
 
@@ -379,11 +380,16 @@ def _build_qblock_mappings(
     qb_to_qblock = arange_all - cu_blocks.repeat_interleave(qb_per_req)
 
     # block_table[qb, blk] = physical page of logical block blk of qb's request.
-    blk_cols = torch.arange(max_blocks, device=device, dtype=torch.long) * page_size
-    max_cols = req_to_token.shape[1]
-    blk_cols = blk_cols.clamp(max=max_cols - 1)
-    token_slots = req_to_token[qb_to_req][:, blk_cols]  # [all_seqblock_q, max_blocks]
-    block_table = (token_slots // page_size).to(torch.int32)
+    if req_block_table is None:
+        blk_cols = torch.arange(max_blocks, device=device, dtype=torch.long) * page_size
+        max_cols = req_to_token.shape[1]
+        blk_cols = blk_cols.clamp(max=max_cols - 1)
+        token_slots = req_to_token[qb_to_req][:, blk_cols]  # [all_seqblock_q, max_blocks]
+        block_table = (token_slots // page_size).to(torch.int32)
+    else:
+        block_table = req_block_table.to(device=device, dtype=torch.int32).repeat_interleave(
+            qb_per_req, dim=0
+        )
 
     return (
         qb_to_qstart.to(torch.int32),
@@ -406,6 +412,7 @@ def flash_prefill_bnsd_score(
     sm_scale: float,
     score_type: str = "max",
     num_score_chunks: Optional[int] = None,
+    req_block_table: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Block-sparse PREFILL indexer scoring -> score [num_idx_heads, total_q, max_seqblock_k].
 
@@ -438,6 +445,7 @@ def flash_prefill_bnsd_score(
         page_size,
         max_blocks,
         device,
+        req_block_table,
     )
 
     if all_seqblock_q == 0:
@@ -508,6 +516,7 @@ def flash_prefill_bnsd_score_attn(
     block_size_k: int,
     sm_scale: float,
     score_type: str = "max",
+    req_block_table: Optional[torch.Tensor] = None,
 ):
     """Fused block-score + index-head dense attention (query-block tiled).
 
@@ -532,8 +541,15 @@ def flash_prefill_bnsd_score_attn(
         block_table,
         all_seqblock_q,
     ) = _build_qblock_mappings(
-        cu_seqlens, seq_lens, req_to_token, req_pool_indices,
-        block_size_q, page_size, max_blocks, device,
+        cu_seqlens,
+        seq_lens,
+        req_to_token,
+        req_pool_indices,
+        block_size_q,
+        page_size,
+        max_blocks,
+        device,
+        req_block_table,
     )
 
     BLOCK_SIZE_Q = _next_power_of_2(block_size_q)
@@ -578,6 +594,7 @@ def flash_prefill_bnsd_indexer(
     topk: int,
     sm_scale: float,
     score_type: str = "max",
+    req_block_table: Optional[torch.Tensor] = None,
 ):
     """Prefill indexer (fused): returns (idx_o, topk_idx [num_idx_heads, total_q, topk]).
 
@@ -588,7 +605,7 @@ def flash_prefill_bnsd_indexer(
     score, idx_o = flash_prefill_bnsd_score_attn(
         q, k_cache_bnsd, v_cache_bnsd, cu_seqlens, seq_lens,
         req_to_token, req_pool_indices, block_size_q, block_size_k,
-        sm_scale, score_type,
+        sm_scale, score_type, req_block_table,
     )
     max_seqblock_k = score.shape[-1]
     actual_topk = min(topk, max_seqblock_k)
@@ -615,6 +632,7 @@ def flash_prefill_bnsd_with_topk_idx(
     topk: int,
     sm_scale: float,
     score_type: str = "max",
+    req_block_table: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Prefill indexer: score (varlen, batched over query-blocks) + topk.
 
@@ -625,7 +643,7 @@ def flash_prefill_bnsd_with_topk_idx(
     score = flash_prefill_bnsd_score(
         q, k_cache_bnsd, cu_seqlens, seq_lens,
         req_to_token, req_pool_indices, block_size_q, block_size_k,
-        sm_scale, score_type,
+        sm_scale, score_type, req_block_table=req_block_table,
     )
     max_seqblock_k = score.shape[-1]
     actual_topk = min(topk, max_seqblock_k)

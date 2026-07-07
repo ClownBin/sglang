@@ -174,6 +174,24 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
         self.assertIn("extend_prefix_lens_cpu=", body)
         self.assertIn("extend_seq_lens_cpu=", body)
 
+    def test_replay_fb_view_carries_extend_metadata_for_ascend_verify(self):
+        source = _read(
+            "python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py"
+        )
+        tree = ast.parse(source)
+        build_replay_fb_view = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "build_replay_fb_view"
+        )
+        body = ast.get_source_segment(source, build_replay_fb_view)
+
+        self.assertIn("extend_prefix_lens=", body)
+        self.assertIn("extend_seq_lens=", body)
+        self.assertIn("extend_prefix_lens_cpu=", body)
+        self.assertIn("extend_seq_lens_cpu=", body)
+
     def test_swigluoai_has_npu_eager_path(self):
         source = _read("python/sglang/srt/models/minimax_m3.py")
         tree = ast.parse(source)

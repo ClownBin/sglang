@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from sglang.srt.configs.model_config import is_minimax_sparse
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
     EAGLEDraftExtendNpuGraphRunner,
@@ -365,6 +366,32 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner.attn_backend = self.draft_extend_attn_backend
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
+    def _disable_minimax_m3_npu_eagle_draft_graphs(self) -> bool:
+        if not (_is_npu and self.speculative_algorithm.is_eagle3()):
+            return False
+
+        hf_configs = [
+            getattr(
+                getattr(self.target_worker, "model_config", None), "hf_config", None
+            ),
+            getattr(
+                getattr(
+                    getattr(self.target_worker, "model_runner", None),
+                    "model_config",
+                    None,
+                ),
+                "hf_config",
+                None,
+            ),
+            getattr(
+                getattr(self.draft_runner, "model_config", None), "hf_config", None
+            ),
+        ]
+        return any(
+            hf_config is not None and is_minimax_sparse(hf_config)
+            for hf_config in hf_configs
+        )
+
     def _capture_cuda_graphs(self):
         """Capture the draft worker's own cuda graphs (decode + draft-extend)."""
         self.cuda_graph_runner = None
@@ -374,6 +401,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             return
 
         if self.server_args.model_impl == "mindspore":
+            return
+
+        if self._disable_minimax_m3_npu_eagle_draft_graphs():
+            log_info_on_rank0(
+                logger,
+                "Skip EAGLE draft CUDA graphs for MiniMax-M3 on NPU; "
+                "draft decode and draft-extend keep eager seq_lens handling.",
+            )
             return
 
         Device2DraftCudaGraphRunner = {

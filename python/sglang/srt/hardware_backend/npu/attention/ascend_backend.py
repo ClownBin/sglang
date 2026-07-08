@@ -10,8 +10,11 @@ from sgl_kernel_npu.attention.sinks_attention import (
     attention_sinks_triton,
 )
 
-from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.configs.model_config import AttentionArch, is_minimax_sparse
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.hardware_backend.npu.attention.minimax_m3_dense_verify_triton import (
+    dense_verify_paged_attention,
+)
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
 )
@@ -289,6 +292,7 @@ class AscendAttnBackend(AttentionBackend):
         self.page_size = model_runner.page_size
         self.model_dtype = model_runner.model_config.dtype
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+        self._is_minimax_m3 = is_minimax_sparse(model_runner.model_config.hf_config)
         if self.use_mla:
             self.kv_lora_rank = model_runner.model_config.kv_lora_rank
             self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
@@ -341,6 +345,9 @@ class AscendAttnBackend(AttentionBackend):
                 model_runner.token_to_kv_pool.full_to_swa_index_mapping
             )
             self.sliding_window_size = model_runner.sliding_window_size
+        self._minimax_m3_dense_verify_static_supported = (
+            self._is_minimax_m3 and not self.use_mla and not self.is_hybrid_swa
+        )
         self.use_sliding_window_kv_pool = (
             isinstance(self.token_to_kv_pool, SWAKVPool)
             and self.token_to_kv_pool.swa_layer_nums > 0
@@ -380,6 +387,36 @@ class AscendAttnBackend(AttentionBackend):
         d = layer.qk_head_dim
         v = layer.v_head_dim
         return (d == v and d in (128, 192, 256)) or (d == 192 and v == 128)
+
+    def _can_use_minimax_m3_triton_mtp_verify(
+        self,
+        forward_batch: ForwardBatch,
+        layer: Optional[RadixAttention] = None,
+        sinks: Optional[torch.Tensor] = None,
+    ) -> bool:
+        if not (
+            self._is_minimax_m3
+            and forward_batch.forward_mode.is_target_verify()
+            and self.graph_mode
+            and not self.use_mla
+            and sinks is None
+        ):
+            return False
+
+        if layer is None:
+            return self._minimax_m3_dense_verify_static_supported
+
+        return (
+            not self._is_swa_layer(layer)
+            and layer.qk_head_dim == layer.v_head_dim
+            and layer.tp_k_head_num == layer.tp_v_head_num
+        )
+
+    def can_skip_npu_graph_seq_lens_update(self, forward_batch: ForwardBatch) -> bool:
+        return self._can_use_minimax_m3_triton_mtp_verify(forward_batch) or (
+            self._minimax_m3_dense_verify_static_supported
+            and forward_batch.forward_mode.is_target_verify()
+        )
 
     def _get_extend_lens_for_block_table(
         self,
@@ -1941,6 +1978,53 @@ class AscendAttnBackend(AttentionBackend):
 
         return attn_output
 
+    def _forward_minimax_m3_triton_mtp_verify(
+        self,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
+        num_tokens = query.shape[0]
+        bs = forward_batch.seq_lens.shape[0]
+        ndt = num_tokens // max(int(bs), 1)
+
+        prefix = forward_batch.seq_lens.to(device=query.device, dtype=torch.long).clamp(
+            min=0
+        )
+        offsets = torch.arange(
+            1, int(ndt) + 1, device=query.device, dtype=torch.long
+        )
+        per_query_seq_lens = (
+            (prefix.unsqueeze(1) + offsets.unsqueeze(0)).reshape(-1).to(torch.int32)
+        )
+
+        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
+            -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+        )
+        v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
+            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+        )
+        num_pages = k_cache.shape[0]
+        block_table = (
+            self.forward_metadata.block_tables[:bs]
+            .repeat_interleave(int(ndt), dim=0)
+            .to(torch.int32)
+            .clamp(min=0, max=num_pages - 1)
+            .contiguous()
+        )
+
+        attn_output = dense_verify_paged_attention(
+            q=query,
+            k_cache_bnsd=k_cache,
+            v_cache_bnsd=v_cache,
+            block_table=block_table,
+            per_query_seq_lens=per_query_seq_lens,
+            block_size=self.page_size,
+            sm_scale=layer.scaling,
+        )
+        return attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
     def forward_mtp(
         self,
         q,
@@ -1972,6 +2056,13 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
         if not self.use_mla:
+            if self._can_use_minimax_m3_triton_mtp_verify(
+                forward_batch, layer, sinks
+            ):
+                return self._forward_minimax_m3_triton_mtp_verify(
+                    q, layer, forward_batch
+                )
+
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
                 -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
             )

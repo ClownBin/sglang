@@ -89,6 +89,10 @@ class AttentionBackend(ABC):
     # Opt out only when this backend never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = True
 
+    def can_skip_npu_graph_seq_lens_update(self, forward_batch: ForwardBatch) -> bool:
+        """Whether NPU graph replay can skip NPUGraph.update for seq lengths."""
+        return False
+
     # Most attention backends can rebuild and replace forward metadata before
     # every forward. BCG capture is different: some backends expose metadata
     # tensors to kernels across graph breaks, so the captured graph depends on

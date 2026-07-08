@@ -197,6 +197,187 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
                     function_sources[name],
                 )
 
+    def test_minimax_m3_dense_verify_triton_module_is_dedicated_dense_path(self):
+        source = _read(
+            "python/sglang/srt/hardware_backend/npu/attention/"
+            "minimax_m3_dense_verify_triton.py"
+        )
+
+        self.assertIn("dense_verify_paged_attention", source)
+        self.assertIn("NUM_KV_CHUNKS", source)
+        self.assertIn("per_query_seq_lens", source)
+        self.assertIn("block_table", source)
+        self.assertIn("chunk_size_blocks = max(2, chunk_size_blocks)", source)
+        self.assertIn("safe_logical_block", source)
+        self.assertIn("logical_block < max_blocks", source)
+        self.assertNotIn("topk_idx", source)
+        self.assertNotIn("flash_decode_bnsd_with_gqa_share_sparse", source)
+
+    def test_minimax_m3_dense_verify_gate_avoids_fia_cpu_seq_list(self):
+        source = _read("python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py")
+        tree = ast.parse(source)
+        function_sources = {
+            node.name: ast.get_source_segment(source, node)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+
+        gate = function_sources["_can_use_minimax_m3_triton_mtp_verify"]
+        impl = function_sources["_forward_minimax_m3_triton_mtp_verify"]
+        forward_mtp = function_sources["forward_mtp"]
+
+        for fragment in (
+            "forward_batch.forward_mode.is_target_verify()",
+            "self.graph_mode",
+            "not self.use_mla",
+            "sinks is None",
+            "not self._is_swa_layer(layer)",
+            "layer.qk_head_dim == layer.v_head_dim",
+            "self._is_minimax_m3",
+        ):
+            self.assertIn(fragment, gate)
+
+        self.assertIn("dense_verify_paged_attention", impl)
+        self.assertIn("forward_batch.seq_lens", impl)
+        self.assertIn("repeat_interleave", impl)
+        self.assertNotIn(".cpu().int().tolist()", impl)
+
+        gate_idx = forward_mtp.index("_can_use_minimax_m3_triton_mtp_verify")
+        fia_idx = forward_mtp.index("seq_lens_cpu_int.cpu().int().tolist()")
+        self.assertLess(gate_idx, fia_idx)
+
+    def test_npu_graph_seq_lens_update_skip_is_backend_opt_in_only(self):
+        base_source = _read("python/sglang/srt/layers/attention/base_attn_backend.py")
+        ascend_source = _read(
+            "python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py"
+        )
+        hybrid_source = _read(
+            "python/sglang/srt/layers/attention/minimax_sparse_backend.py"
+        )
+        runner_source = _read(
+            "python/sglang/srt/hardware_backend/npu/graph_runner/npu_graph_runner.py"
+        )
+        ascend_tree = ast.parse(ascend_source)
+        ascend_functions = {
+            node.name: ast.get_source_segment(ascend_source, node)
+            for node in ast.walk(ascend_tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+        ascend_skip_fn = ascend_functions["can_skip_npu_graph_seq_lens_update"]
+
+        self.assertIn(
+            "def can_skip_npu_graph_seq_lens_update(self, forward_batch: ForwardBatch)",
+            base_source,
+        )
+        self.assertIn("return False", base_source)
+        self.assertIn(
+            "def can_skip_npu_graph_seq_lens_update", ascend_source
+        )
+        self.assertIn(
+            "return self._can_use_minimax_m3_triton_mtp_verify",
+            ascend_source,
+        )
+        self.assertIn(
+            "self._minimax_m3_dense_verify_static_supported",
+            ascend_skip_fn,
+        )
+        self.assertIn(
+            "def can_skip_npu_graph_seq_lens_update", hybrid_source
+        )
+        self.assertIn(
+            "return self.dense.can_skip_npu_graph_seq_lens_update(forward_batch)",
+            hybrid_source,
+        )
+        self.assertIn("can_skip_npu_graph_seq_lens_update", runner_source)
+        self.assertIn("self.backend.replay(graph_key, forward_batch)", runner_source)
+        self.assertIn("self.backend.replay_with_input_update", runner_source)
+
+    def test_npu_backend_has_minimax_target_verify_update_guard(self):
+        source = _read(
+            "python/sglang/srt/hardware_backend/npu/graph_runner/"
+            "npu_cudagraph_backend.py"
+        )
+        tree = ast.parse(source)
+        function_sources = {
+            node.name: ast.get_source_segment(source, node)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+
+        guard = function_sources["_can_skip_minimax_m3_target_verify_update"]
+        replay_with_update = function_sources["replay_with_input_update"]
+
+        self.assertIn("self._cuda_graph_runner = cuda_graph_runner", source)
+        self.assertIn("is_minimax_sparse", source)
+        self.assertIn("SimpleNamespace", source)
+        self.assertIn("capture_forward_mode.is_target_verify()", guard)
+        self.assertIn("can_skip_npu_graph_seq_lens_update", guard)
+        self.assertIn("spec_algorithm.is_speculative()", guard)
+        self.assertIn("is_draft_worker", guard)
+        self.assertIn("use_mla_backend", guard)
+        self.assertIn("is_hybrid_swa", guard)
+        self.assertIn("has_attention_sinks", guard)
+        self.assertIn("actual_seq_kvlen", guard)
+        self.assertIn("actual_seq_lengths_kv", guard)
+        self.assertIn(
+            "self._can_skip_minimax_m3_target_verify_update",
+            replay_with_update,
+        )
+        self.assertLess(
+            replay_with_update.index("cpu_update_input = [{attr_name: seq_lens}]"),
+            replay_with_update.index(
+                "self._can_skip_minimax_m3_target_verify_update"
+            ),
+        )
+        self.assertLess(
+            replay_with_update.index(
+                "self._can_skip_minimax_m3_target_verify_update"
+            ),
+            replay_with_update.index("graph.update"),
+        )
+
+    def test_minimax_m3_npu_eagle3_disables_draft_graph_update_paths(self):
+        source = _read("python/sglang/srt/speculative/eagle_worker_v2.py")
+        tree = ast.parse(source)
+        function_sources = {
+            node.name: ast.get_source_segment(source, node)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+
+        guard = function_sources["_disable_minimax_m3_npu_eagle_draft_graphs"]
+        capture = function_sources["_capture_cuda_graphs"]
+
+        self.assertIn("is_minimax_sparse", source)
+        self.assertIn("_is_npu", guard)
+        self.assertIn("self.speculative_algorithm.is_eagle3()", guard)
+        self.assertIn("self.target_worker", guard)
+        self.assertIn("self.draft_runner", guard)
+        self.assertIn("is_minimax_sparse(hf_config)", guard)
+        self.assertIn(
+            "if self._disable_minimax_m3_npu_eagle_draft_graphs():",
+            capture,
+        )
+        self.assertLess(
+            capture.index("if self._disable_minimax_m3_npu_eagle_draft_graphs():"),
+            capture.index("EAGLEDraftNpuGraphRunner"),
+        )
+        self.assertLess(
+            capture.index("if self._disable_minimax_m3_npu_eagle_draft_graphs():"),
+            capture.index("EAGLEDraftExtendNpuGraphRunner"),
+        )
+
+    def test_tbo_backend_delegates_npu_graph_seq_lens_update_skip(self):
+        source = _read("python/sglang/srt/layers/attention/tbo_backend.py")
+
+        self.assertIn(
+            "def can_skip_npu_graph_seq_lens_update", source
+        )
+        self.assertIn(
+            "return self.primary.can_skip_npu_graph_seq_lens_update(forward_batch)",
+            source,
+        )
+
     def test_inner_fb_view_carries_extend_metadata_for_ascend_draft(self):
         source = _read("python/sglang/srt/model_executor/forward_batch_info.py")
         tree = ast.parse(source)

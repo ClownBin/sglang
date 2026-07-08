@@ -133,6 +133,9 @@ class TboAttnBackend(AttentionBackend):
             assert ans == child.get_cuda_graph_seq_len_fill_value()
         return ans
 
+    def can_skip_npu_graph_seq_lens_update(self, forward_batch: "ForwardBatch") -> bool:
+        return self.primary.can_skip_npu_graph_seq_lens_update(forward_batch)
+
     def get_verify_buffers_to_fill_after_draft(self):
         return self.primary.get_verify_buffers_to_fill_after_draft()
 

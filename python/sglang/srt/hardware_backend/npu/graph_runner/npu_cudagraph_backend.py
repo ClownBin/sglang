@@ -15,11 +15,13 @@ from __future__ import annotations
 import threading
 from contextlib import AbstractContextManager, contextmanager
 from functools import partial
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import numpy as np
 import torch
 
+from sglang.srt.configs.model_config import is_minimax_sparse
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
@@ -52,6 +54,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._graphs: Dict[Any, Any] = {}
         self._outputs: Dict[Any, Any] = {}
         self._pool = None
+        self._cuda_graph_runner = cuda_graph_runner
         self._device_module = cuda_graph_runner.device_module
         self._tp_group = cuda_graph_runner.model_runner.tp_group
         self._capture_stream = None
@@ -138,6 +141,68 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._graphs[shape_key].replay()
         return self._outputs[shape_key]
 
+    @staticmethod
+    def _cpu_update_attr_names(
+        attr_name: str = None,
+        cpu_update_input: list = None,
+    ) -> set[str]:
+        names = set()
+        if attr_name is not None:
+            names.add(attr_name)
+        if cpu_update_input is not None:
+            for item in cpu_update_input:
+                names.update(item.keys())
+        return names
+
+    def _can_skip_minimax_m3_target_verify_update(
+        self,
+        cpu_update_input: list = None,
+    ) -> bool:
+        attr_names = self._cpu_update_attr_names(cpu_update_input=cpu_update_input)
+        if attr_names not in ({"actual_seq_kvlen"}, {"actual_seq_lengths_kv"}):
+            return False
+
+        runner = self._cuda_graph_runner
+        model_runner = getattr(runner, "model_runner", None)
+        if model_runner is None or getattr(model_runner, "is_draft_worker", False):
+            return False
+
+        model_config = getattr(model_runner, "model_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        if hf_config is None or not is_minimax_sparse(hf_config):
+            return False
+
+        capture_forward_mode = getattr(runner, "capture_forward_mode", None)
+        attn_backend = getattr(runner, "attn_backend", None) or getattr(
+            model_runner, "attn_backend", None
+        )
+        can_skip = getattr(attn_backend, "can_skip_npu_graph_seq_lens_update", None)
+        if capture_forward_mode is not None and can_skip is not None:
+            if can_skip(SimpleNamespace(forward_mode=capture_forward_mode)):
+                return True
+
+        if capture_forward_mode is not None:
+            if not capture_forward_mode.is_target_verify():
+                return False
+        else:
+            spec_algorithm = getattr(model_runner, "spec_algorithm", None)
+            if not (
+                spec_algorithm is not None and spec_algorithm.is_speculative()
+            ):
+                return False
+
+        if getattr(model_runner, "use_mla_backend", False) or getattr(
+            model_runner, "is_hybrid_swa", False
+        ):
+            return False
+        if getattr(model_config, "has_attention_sinks", False):
+            return False
+        return True
+
+    def _replay_without_update(self, shape_key: ShapeKey) -> Any:
+        self._graphs[shape_key].replay()
+        return self._outputs[shape_key]
+
     def replay_with_input_update(
         self,
         shape_key: ShapeKey,
@@ -159,6 +224,11 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             if isinstance(attr_type, torch.Tensor):
                 seq_lens = torch.from_numpy(np.array(seq_lens).astype(np.int32))
             cpu_update_input = [{attr_name: seq_lens}]
+
+        if self._can_skip_minimax_m3_target_verify_update(
+            cpu_update_input=cpu_update_input
+        ):
+            return self._replay_without_update(shape_key)
 
         graph = self._graphs[shape_key]
 

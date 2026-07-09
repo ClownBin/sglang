@@ -204,14 +204,38 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
         )
 
         self.assertIn("dense_verify_paged_attention", source)
-        self.assertIn("NUM_KV_CHUNKS", source)
+        self.assertIn("NUM_BLOCKS", source)
         self.assertIn("per_query_seq_lens", source)
         self.assertIn("block_table", source)
-        self.assertIn("chunk_size_blocks = max(2, chunk_size_blocks)", source)
+        self.assertIn("grid = (batch_size, num_kv_heads)", source)
         self.assertIn("safe_logical_block", source)
         self.assertIn("logical_block < max_blocks", source)
+        self.assertIn("num_pages", source)
+        self.assertIn(
+            "physical_block = tl.minimum(tl.maximum(physical_block, 0), num_pages - 1)",
+            source,
+        )
+        self.assertIn("safe_off_h", source)
+        self.assertIn("safe_off_d", source)
+        self.assertIn("safe_off_n", source)
+        self.assertIn("pid_h + safe_off_h[:, None]", source)
+        self.assertIn("safe_off_d[None, :] * stride_q_d", source)
+        self.assertIn("safe_off_n[None, :] * stride_k_offset", source)
+        self.assertIn("safe_off_n[:, None] * stride_v_offset", source)
         self.assertNotIn("topk_idx", source)
         self.assertNotIn("flash_decode_bnsd_with_gqa_share_sparse", source)
+        self.assertNotIn("_merge_topk_attn_out_bnsd_kernel", source)
+
+    def test_minimax_m3_dense_verify_graph_uses_single_kernel_without_merge(self):
+        source = _read(
+            "python/sglang/srt/hardware_backend/npu/attention/"
+            "minimax_m3_dense_verify_triton.py"
+        )
+
+        self.assertIn("num_kv_chunks = 1", source)
+        self.assertNotIn("_merge_topk_attn_out_bnsd_kernel", source)
+        self.assertNotIn("lse_partial", source)
+        self.assertNotIn("o_partial", source)
 
     def test_minimax_m3_dense_verify_gate_avoids_fia_cpu_seq_list(self):
         source = _read("python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py")
@@ -366,6 +390,57 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
             capture.index("if self._disable_minimax_m3_npu_eagle_draft_graphs():"),
             capture.index("EAGLEDraftExtendNpuGraphRunner"),
         )
+
+    def test_minimax_m3_npu_eagle3_keeps_target_verify_graph(self):
+        source = _read("python/sglang/srt/speculative/eagle_utils.py")
+
+        self.assertNotIn(
+            "_disable_minimax_m3_npu_eagle_target_verify_graph", source
+        )
+        self.assertNotIn("verify_forward_batch.disable_cuda_graph", source)
+
+    def test_minimax_m3_npu_eagle3_target_verify_captures_exact_odd_bs(self):
+        source = _read(
+            "python/sglang/srt/model_executor/runner/base_cuda_graph_runner.py"
+        )
+
+        self.assertIn(
+            "_should_capture_minimax_m3_eagle3_target_verify_exact_bs", source
+        )
+        self.assertIn("is_minimax_sparse", source)
+        self.assertIn("is_npu", source)
+        self.assertIn("model_runner.spec_algorithm.is_eagle3()", source)
+        self.assertIn("not model_runner.is_draft_worker", source)
+        self.assertIn("not model_runner.server_args.enable_two_batch_overlap", source)
+        self.assertIn("num_tokens_per_bs > 1", source)
+        self.assertIn("range(1, min(16, num_max_requests) + 1)", source)
+
+    def test_model_runner_does_not_have_per_batch_cuda_graph_disable(self):
+        forward_batch_source = _read(
+            "python/sglang/srt/model_executor/forward_batch_info.py"
+        )
+        model_runner_source = _read(
+            "python/sglang/srt/model_executor/model_runner.py"
+        )
+
+        self.assertNotIn("disable_cuda_graph: bool = False", forward_batch_source)
+        self.assertNotIn("forward_batch.disable_cuda_graph", model_runner_source)
+
+    def test_eagle3_debug_spec_cycle_syncs_verify_boundaries(self):
+        source = _read("python/sglang/srt/speculative/eagle_worker_v2.py")
+
+        self.assertIn("def _debug_spec_cycle_sync", source)
+        self.assertIn("envs.SGLANG_DEBUG_SPEC_CYCLE.get()", source)
+        self.assertIn("torch.get_device_module(device).synchronize()", source)
+        for label in (
+            "decode.after_draft",
+            "verify.before_target_forward",
+            "verify.after_target_forward",
+            "verify.after_eagle_sample",
+            "verify.after_bonus_tokens",
+            "decode.after_verify_before_draft_extend",
+        ):
+            self.assertIn(label, source)
 
     def test_tbo_backend_delegates_npu_graph_seq_lens_update_skip(self):
         source = _read("python/sglang/srt/layers/attention/tbo_backend.py")

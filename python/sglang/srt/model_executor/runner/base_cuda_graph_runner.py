@@ -22,9 +22,11 @@ from abc import abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, List, Sequence, Tuple
 
+from sglang.srt.configs.model_config import is_minimax_sparse
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import require_gathered_buffer
+from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
@@ -34,6 +36,21 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+
+def _should_capture_minimax_m3_eagle3_target_verify_exact_bs(
+    model_runner: ModelRunner, num_tokens_per_bs: int
+) -> bool:
+    if not (
+        num_tokens_per_bs > 1
+        and not model_runner.is_draft_worker
+        and model_runner.spec_algorithm.is_eagle3()
+        and not model_runner.server_args.enable_two_batch_overlap
+        and getattr(model_runner.server_args, "device", None) == "npu"
+    ):
+        return False
+
+    return is_npu() and is_minimax_sparse(model_runner.model_config.hf_config)
 
 
 @contextmanager
@@ -85,6 +102,11 @@ def get_batch_sizes_to_capture(
         # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
         # is very small. We add more values here to make sure we capture the maximum bs.
         capture_bs += [num_max_requests]
+
+    if _should_capture_minimax_m3_eagle3_target_verify_exact_bs(
+        model_runner, num_tokens_per_bs
+    ):
+        capture_bs.extend(range(1, min(16, num_max_requests) + 1))
 
     # Model input token count = bs * num_tokens_per_bs; must be a multiple of attn_tp_size.
     capture_bs = [bs for bs in capture_bs if bs * num_tokens_per_bs % mul_base == 0]

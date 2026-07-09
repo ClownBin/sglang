@@ -116,6 +116,19 @@ _is_hip = is_hip()
 logger = logging.getLogger(__name__)
 
 
+def _debug_spec_cycle_sync(device: str, label: str) -> None:
+    if not envs.SGLANG_DEBUG_SPEC_CYCLE.get():
+        return
+
+    tic = time.perf_counter()
+    torch.get_device_module(device).synchronize()
+    logger.info(
+        "SGLANG_DEBUG_SPEC_CYCLE sync label=%s elapsed_ms=%.3f",
+        label,
+        (time.perf_counter() - tic) * 1000,
+    )
+
+
 def _get_plan_stream(
     device: str,
 ) -> Tuple[any, contextlib.AbstractContextManager]:
@@ -1183,9 +1196,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     spec_stage_span("draft"),
                 ):
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
+                _debug_spec_cycle_sync(self.device, "decode.after_draft")
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
             batch_output = self.verify(batch)
+            _debug_spec_cycle_sync(
+                self.device, "decode.after_verify_before_draft_extend"
+            )
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
@@ -1543,11 +1560,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # eagle_prepare_for_verify marked the batch in exactly that case; the
         # non-cuda-graph path stays unmarked and gets forward_extend's init
         # (post-pad).
+        _debug_spec_cycle_sync(self.device, "verify.before_target_forward")
         forward_batch_output = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
         )
+        _debug_spec_cycle_sync(self.device, "verify.after_target_forward")
         logits_output = forward_batch_output.logits_output
 
         # Generate vocab mask for constrained decoding
@@ -1578,6 +1597,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_lens,
             accept_index,
         ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
+        _debug_spec_cycle_sync(self.device, "verify.after_eagle_sample")
         new_seq_lens = batch.seq_lens + accept_lens
         clear_unaccepted_c128 = getattr(
             self.token_to_kv_pool_allocator.get_kvcache(),
@@ -1614,6 +1634,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
         else:
             bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
+        _debug_spec_cycle_sync(self.device, "verify.after_bonus_tokens")
 
         if batch.return_logprob and not batch.forward_mode.is_idle():
             compute_spec_v2_logprobs(

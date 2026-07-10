@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
+
+logger = logging.getLogger(__name__)
 
 
 def _next_power_of_2(x: int) -> int:
@@ -72,7 +75,10 @@ def _choose_num_kv_chunks(
 def _choose_num_score_chunks(
     max_seqblock: int,
     blocks_per_chunk: int = 16,
-    max_chunks: int = 16,
+    max_chunks: int = 32,
+    all_seqblock_q: int = 1,
+    num_kv_heads: int = 1,
+    program_cap: int = 32768,
 ) -> int:
     """Pick the number of block-tiles for the chunked score-only kernel.
 
@@ -80,11 +86,23 @@ def _choose_num_score_chunks(
     program count no longer scales with context length. We pick enough chunks to
     keep the per-program serial loop near ``blocks_per_chunk`` while bounding the
     total (power-of-two to keep the kernel-specialization set small).
+
+    Grid = ``all_seqblock_q * num_score_chunks * num_kv_heads``. Ascend caps the
+    total program count of a single kernel launch (~``program_cap``, 32768). At
+    ``block_size_q=1`` (MiniMax-M3 per-token topk) ``all_seqblock_q`` equals the
+    extend length (e.g. 3072 at dp4), and once KV crosses 256 blocks the balance
+    pushes ``num_score_chunks`` to 16 -> grid 49152 > cap, and the launch HANGS
+    (aicore execution timeout 507014). Cap ``num_score_chunks`` so the grid stays
+    under ``program_cap``; each program then scans more KV blocks serially (slower
+    per program, but the launch completes). Defaults leave existing callers
+    (small batch / decode) unchanged.
     """
     if max_seqblock <= 0:
         return 1
     balance = (max_seqblock + max(1, blocks_per_chunk) - 1) // max(1, blocks_per_chunk)
     n = max(1, min(balance, max(1, max_chunks)))
+    per_chunk = max(1, all_seqblock_q * max(1, num_kv_heads))
+    n = min(n, max(1, program_cap // per_chunk))
     return 1 << (n.bit_length() - 1)
 
 
@@ -1044,6 +1062,16 @@ def flash_decode_bnsd_with_topk_idx(
     # Current serving (context-length=10240 -> max_seqblock<=80) stays on triton.
     if use_triton_topk is None:
         use_triton_topk = max_seqblock <= 256
+    elif use_triton_topk and max_seqblock > 256:
+        # Hard guard: triton streaming topk does a serial O(max_seqblock) scan
+        # with num_warps=1 and would be catastrophic (>1024 serial iterations at
+        # 128K). Force torch.topk path instead.
+        logger.warning(
+            f"[MiniMaxSparse] use_triton_topk=True forced but max_seqblock="
+            f"{max_seqblock} > 256 — overriding to False (torch path) to avoid "
+            f"serial-scan catastrophe"
+        )
+        use_triton_topk = False
 
     # Trivial-skip gate: only skip score writes when the downstream topk backend
     # does not read score for trivial batches (num_blocks <= topk). The streaming
@@ -1077,7 +1105,10 @@ def flash_decode_bnsd_with_topk_idx(
             # One program per (batch, kv-head, block-tile); Q loaded once per
             # tile. Program count is independent of context length.
             num_score_chunks = _choose_num_score_chunks(
-                max_seqblock, blocks_per_chunk=score_blocks_per_chunk
+                max_seqblock,
+                blocks_per_chunk=score_blocks_per_chunk,
+                all_seqblock_q=batch_size,
+                num_kv_heads=num_kv_heads,
             )
             grid_score = (batch_size * num_score_chunks, num_kv_heads)
             _decode_bnsd_score_chunk_kernel[grid_score](

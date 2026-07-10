@@ -58,7 +58,19 @@ def _npu_use_triton_prefill() -> bool:
 # midpoint. Auto-enable Approach A at/above this KV length so long-context prefills
 # get the sparse win without regressing the short-context case (which stays PyTorch).
 # Override with SGLANG_MINIMAX_NPU_TRITON_PREFILL (forces on for all lengths).
-MINIMAX_NPU_TRITON_PREFILL_AUTO_MIN_SEQLEN = 12288
+MINIMAX_NPU_TRITON_PREFILL_AUTO_MIN_SEQLEN = 20000
+
+# Adaptive block_size_q thresholds: larger BSQ reduces all_seqblock_q, allowing
+# more num_score_chunks under the Ascend program_cap (32768), which shortens the
+# per-program serial loop in the prefill score kernel.  Trade-off: coarser top-k
+# selection granularity.  Standalone tests validate BSQ {1,4,8,16}.
+#
+# BSQ only affects the **serial loop** (driven by max_seqlen_k); it does NOT
+# change coreDim (driven by total_q, already protected by program_cap).
+_BSQ_THRESHOLD_16 = 65536  # max_seqlen_k >= 64K -> BSQ=16 (bench_pinpoint: 17ms/layer @131K vs 28ms@BSQ=8)
+_BSQ_THRESHOLD_8 = 32768   # max_seqlen_k >= 32K -> BSQ=8
+# BSQ=16 is UB-safe for the prefill indexer: BLOCK_SIZE_H=next_pow2(gqa)=1 (not
+# padded to 16 like decode), so Q tile = [BSQ*1, 128] = 4KB at BSQ=16.
 
 
 def _npu_triton_prefill_auto(seq_lens: torch.Tensor) -> bool:
@@ -234,6 +246,64 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             f"main_attn={'MSA' if self.use_msa else 'triton'}, "
             f"disable_value_layers={sorted(self.disable_value_layer_ids)})"
         )
+
+    @staticmethod
+    def _choose_block_size_q(max_seqlen_k: int) -> int:
+        """Pick block_size_q adaptively based on max KV sequence length.
+
+        Larger block_size_q reduces ``all_seqblock_q`` (the number of query blocks),
+        which allows more ``num_score_chunks`` under the Ascend program_cap (32768).
+        More chunks -> fewer KV blocks scanned per program -> shorter serial loop
+        in the prefill score kernel.
+
+        Trade-off: coarser query batching means top-k block selection operates on
+        groups of tokens instead of individually, which may slightly reduce
+        selection precision (mitigated by init+local forced blocks).
+
+        .. note::
+           BSQ only affects the **serial loop** (driven by ``max_seqlen_k``); it
+           does NOT change coreDim (driven by ``total_q``, already protected by
+           ``program_cap``).
+        """
+        if max_seqlen_k >= _BSQ_THRESHOLD_16:
+            return 16
+        if max_seqlen_k >= _BSQ_THRESHOLD_8:
+            return 8
+        return 1
+
+    @staticmethod
+    def _get_safe_block_size_q(
+        max_seqlen_k: int,
+        extend_lens_cpu: "torch.Tensor | None" = None,
+    ) -> int:
+        """Adaptive BSQ with cross-request contamination safety guard.
+
+        BSQ>1 batches multiple query tokens into a block. When a request's
+        ``extend_len`` is not an exact multiple of BSQ, its last q-block is
+        **partial**: the phantom rows (qi beyond the request's real tokens)
+        fall into the next request's token range, read that request's Q,
+        but write scores using **this request's block_table** (KV).
+
+        The prefill score kernels (_prefill_bnsd_score_kernel,
+        _prefill_bnsd_score_attn_kernel) already guard against cross-request
+        contamination via ``row_valid = (q_token_flat < q_end)`` where
+        ``q_end`` is ``cu_seqlens[r+1]`` (the exclusive upper bound of the
+        owning request's token range). Phantom rows' stores are masked, so
+        their computed (garbage) scores are never written to the output.
+
+        To prevent phantom rows from wasting memory bandwidth by reading Q
+        data from the next request, the kernels also clamp ``q_token_flat``
+        to ``max(q_start, q_end - 1)`` before the Q load, confining every
+        read to the owning request's token range.
+
+        With these two guards (masked store + clamped read), BSQ>1 is safe
+        for ALL batch configurations, including multi-request batches with
+        non-aligned extend lengths. The fallback to BSQ=1 is removed.
+        """
+        bsq = MiniMaxSparseAttnBackend._choose_block_size_q(max_seqlen_k)
+        if bsq == 1:
+            return 1
+        return bsq
 
     # ------------------------------------------------------------------
     # Delegation helpers
@@ -1399,6 +1469,14 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             else int(per_query_seq_lens.max().item())
         )
         max_blocks = (max_seqlen + page_size - 1) // page_size
+        # Adaptive block_size_q: increase BSQ for long context to reduce
+        # all_seqblock_q and allow more num_score_chunks under program_cap,
+        # shortening the per-program serial loop in the prefill score kernel.
+        # ``_get_safe_block_size_q`` also verifies that BSQ>1 will not cause
+        # cross-request contamination (partial q-blocks leaking into adjacent
+        # requests), falling back to BSQ=1 when unsafe.
+        extend_lens_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        block_size_q = self._get_safe_block_size_q(max_seqlen, extend_lens_cpu)
         if not getattr(self, "_prefill_diag_logged", False):
             self._prefill_diag_logged = True
             logger.warning(
@@ -1442,7 +1520,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             topk_idx = _flash_prefill_score_topk(
                 idx_q, idx_k_bnsd, cu_seqlens, seq_lens,
                 self.req_to_token, forward_batch.req_pool_indices,
-                self.block_size_q, page_size, self.topk_blocks,
+                block_size_q, page_size, self.topk_blocks,
                 idx_dim**-0.5, self.score_type,
                 req_block_table=req_block_table,
             )
@@ -1450,7 +1528,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             idx_o, topk_idx = flash_prefill_bnsd_indexer(
                 idx_q, idx_k_bnsd, idx_v_bnsd, cu_seqlens, seq_lens,
                 self.req_to_token, forward_batch.req_pool_indices,
-                self.block_size_q, page_size, self.topk_blocks,
+                block_size_q, page_size, self.topk_blocks,
                 idx_dim**-0.5, self.score_type,
                 req_block_table=req_block_table,
             )
@@ -1470,20 +1548,37 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         query_positions = (per_query_seq_lens.to(torch.long) - 1).clamp(min=0)
         topk_merged = self._merge_sparse_blocks(topk_2d, query_positions, max_blocks)
         topk_idx = topk_merged.permute(1, 0, 2).contiguous()
+        # Guard the merged top-k: clamp into valid logical-block range [-1, max_blocks-1].
+        # -1 is the skip sentinel; real blocks are >= 0. Prevents the main kernel from
+        # indexing block_table_f past its column dim if _merge_sparse_blocks appended a
+        # local/init block beyond the query's real KV extent. Mirrors the verify path
+        # (the clamp at the verify main). Real indices already in-range -> correctness
+        # unchanged; this only sanitizes out-of-range entries.
+        topk_idx = topk_idx.clamp(min=-1, max=max_blocks - 1).to(torch.int32)
 
         # 4) main sparse attention over the selected blocks.
-        # Default: per-query **decode main** (validated, ~10ms/sparse-layer). The
-        # per-query-tile **union** kernel (prefill_union_main.py) is a newer
-        # alternative that tiles BSQ_KERNEL query tokens per program and shares a
-        # union-of-topk KV gather. It is CORRECT (matches the decode main at
-        # bf16-noise) but measured ~5x SLOWER on Ascend TBE: the per-token gather
-        # indexing (q_token = q_start+qi, q_pos causal vector, umask gather,
-        # divmod qi=off_qh//H_TILE) compiles far less efficiently than the decode
-        # kernel's clean uniform [H,D] tile. It is therefore OFF by default;
-        # enable for experimentation with MINIMAX_NPU_TRITON_PREFILL_MAIN_UNION=1
-        # (BSQ via MINIMAX_NPU_TRITON_PREFILL_MAIN_BSQ, default 4).
-        _use_union = bool(_os_union.environ.get("MINIMAX_NPU_TRITON_PREFILL_MAIN_UNION"))
-        _bsq = int(_os_union.environ.get("MINIMAX_NPU_TRITON_PREFILL_MAIN_BSQ", "4"))
+        # Two paths: per-query **decode main** (validated, one batch row per extend
+        # token) and per-query-tile **union** kernel (tiles BSQ_KERNEL tokens per
+        # program, sharing a union-of-topk KV gather). The decode path creates
+        # total_q programs; the union path creates total_q/BSQ_KERNEL programs,
+        # drastically reducing launch + scalar overhead at large total_q.
+        #
+        # The union kernel was previously OFF by default because the divmod indexing
+        # (qi=off_qh//H_TILE, hhi=off_qh%H_TILE) compiled poorly on Ascend TBE.
+        # With host-precomputed qi/hhi lookup tables replacing the divmod, the
+        # kernel is now competitive. Auto-enable when total_q exceeds the threshold
+        # where the program-count reduction outweighs the per-tile overhead.
+        _union_env = _os_union.environ.get("MINIMAX_NPU_TRITON_PREFILL_MAIN_UNION")
+        if _union_env is not None:
+            _use_union = bool(int(_union_env))
+            _bsq = int(_os_union.environ.get("MINIMAX_NPU_TRITON_PREFILL_MAIN_BSQ", "4"))
+        else:
+            # Auto: enable union kernel when enough extend tokens exist to benefit
+            # from query tiling (>= 128 tokens, i.e. >= 32 programs at BSQ=4 vs
+            # 128 at BSQ=1). The union kernel's per-tile overhead (causal mask,
+            # umask gather at BSQ>1) is amortised over the shared KV gather.
+            _bsq = max(1, min(MiniMaxSparseAttnBackend._choose_block_size_q(max_seqlen), 8))
+            _use_union = _bsq > 1 and total_q >= 128
 
         def _decode_main():
             # Per-query decode-main: flattens total_q extend tokens into total_q
@@ -1675,9 +1770,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 )
                 idx_o, o = idx_o_t, o_t
             else:
-                prefill_meta = self._build_npu_sparse_prefill_meta(
-                    forward_batch, cu_seqlens, seq_lens, prefix_lens
-                )
                 idx_o, o = self._forward_npu_sparse_prefill(
                     q,
                     k_cache,

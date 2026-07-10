@@ -15,6 +15,7 @@ context.
 """
 
 import dataclasses
+import os
 import unittest
 from types import SimpleNamespace
 from typing import Optional
@@ -26,6 +27,8 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     GraphSlot,
     PaddingPolicy,
 )
+from sglang.srt.model_executor.graph_buffer_copy import _grouped_foreach_copy_
+import sglang.srt.model_executor.graph_buffer_copy as copy_mod
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -168,6 +171,170 @@ class TestRegistryRegister(unittest.TestCase):
         )
         self.assertEqual(slot.buffer.device.type, "cpu")
         self.assertEqual(int(slot.buffer[0].item()), 11)
+
+
+class TestGroupedForeachCopy(unittest.TestCase):
+    def _set_foreach_env(self, value: Optional[str]):
+        old_value = os.environ.get("SGLANG_NPU_GRAPH_COPY_FOREACH")
+        if value is None:
+            os.environ.pop("SGLANG_NPU_GRAPH_COPY_FOREACH", None)
+        else:
+            os.environ["SGLANG_NPU_GRAPH_COPY_FOREACH"] = value
+        return old_value
+
+    def _restore_foreach_env(self, old_value: Optional[str]):
+        if old_value is None:
+            os.environ.pop("SGLANG_NPU_GRAPH_COPY_FOREACH", None)
+        else:
+            os.environ["SGLANG_NPU_GRAPH_COPY_FOREACH"] = old_value
+
+    def test_groups_by_shape_for_strict_foreach_backends(self):
+        old_foreach_copy = torch._foreach_copy_
+        calls = []
+
+        def strict_foreach_copy(dsts, srcs):
+            dst_shapes = {tuple(dst.shape) for dst in dsts}
+            src_shapes = {tuple(src.shape) for src in srcs}
+            if len(dst_shapes) != 1 or len(src_shapes) != 1:
+                raise RuntimeError("mixed shapes in one foreach copy")
+            calls.append((tuple(dsts[0].shape), len(dsts)))
+            for dst, src in zip(dsts, srcs):
+                dst.copy_(src)
+
+        torch._foreach_copy_ = strict_foreach_copy
+        try:
+            dsts = [
+                torch.zeros(4, dtype=torch.int64),
+                torch.zeros(8, dtype=torch.int64),
+                torch.zeros(4, dtype=torch.int64),
+            ]
+            srcs = [
+                torch.ones(4, dtype=torch.int64),
+                torch.ones(8, dtype=torch.int64) * 2,
+                torch.ones(4, dtype=torch.int64) * 3,
+            ]
+
+            _grouped_foreach_copy_(dsts, srcs)
+        finally:
+            torch._foreach_copy_ = old_foreach_copy
+
+        self.assertEqual(calls, [((4,), 2), ((8,), 1)])
+        self.assertTrue(torch.equal(dsts[0], srcs[0]))
+        self.assertTrue(torch.equal(dsts[1], srcs[1]))
+        self.assertTrue(torch.equal(dsts[2], srcs[2]))
+
+    def test_fallback_copy_does_not_call_foreach(self):
+        old_should_use_foreach_copy = (
+            copy_mod.GraphBufferCopyPlanner._should_use_foreach_copy
+        )
+        old_foreach_copy = torch._foreach_copy_
+        calls = []
+
+        def fail_foreach_copy(_dsts, _srcs):
+            raise AssertionError("foreach copy should not be called")
+
+        copy_mod.GraphBufferCopyPlanner._should_use_foreach_copy = (
+            lambda _self, _entries: False
+        )
+        torch._foreach_copy_ = fail_foreach_copy
+        try:
+            dsts = [
+                torch.zeros(4, dtype=torch.int64),
+                torch.zeros(8, dtype=torch.int64),
+            ]
+            srcs = [
+                torch.ones(4, dtype=torch.int64),
+                torch.ones(8, dtype=torch.int64) * 2,
+            ]
+            _grouped_foreach_copy_(dsts, srcs)
+            calls.append("fallback")
+        finally:
+            copy_mod.GraphBufferCopyPlanner._should_use_foreach_copy = (
+                old_should_use_foreach_copy
+            )
+            torch._foreach_copy_ = old_foreach_copy
+
+        self.assertEqual(calls, ["fallback"])
+        self.assertTrue(torch.equal(dsts[0], srcs[0]))
+        self.assertTrue(torch.equal(dsts[1], srcs[1]))
+
+    def test_npu_shape_safe_group_uses_foreach_in_on_mode(self):
+        old_env = self._set_foreach_env("on")
+        old_tensor_device_type = copy_mod._tensor_device_type
+        old_probe = copy_mod._probe_npu_foreach_copy
+        old_foreach_copy = torch._foreach_copy_
+        calls = []
+
+        def foreach_copy(dsts, srcs):
+            calls.append(len(dsts))
+            for dst, src in zip(dsts, srcs):
+                dst.copy_(src)
+
+        copy_mod._tensor_device_type = lambda _tensor: "npu"
+        copy_mod._probe_npu_foreach_copy = lambda _device: True
+        torch._foreach_copy_ = foreach_copy
+        try:
+            dsts = [torch.zeros(4, dtype=torch.int64) for _ in range(2)]
+            srcs = [torch.ones(4, dtype=torch.int64) * i for i in (1, 2)]
+
+            _grouped_foreach_copy_(dsts, srcs, ["a", "b"])
+        finally:
+            copy_mod._tensor_device_type = old_tensor_device_type
+            copy_mod._probe_npu_foreach_copy = old_probe
+            torch._foreach_copy_ = old_foreach_copy
+            self._restore_foreach_env(old_env)
+
+        self.assertEqual(calls, [2])
+        self.assertTrue(torch.equal(dsts[0], srcs[0]))
+        self.assertTrue(torch.equal(dsts[1], srcs[1]))
+
+    def test_npu_stride_unsafe_group_uses_single_copy_in_on_mode(self):
+        old_env = self._set_foreach_env("on")
+        old_tensor_device_type = copy_mod._tensor_device_type
+        old_probe = copy_mod._probe_npu_foreach_copy
+        old_foreach_copy = torch._foreach_copy_
+
+        def fail_foreach_copy(_dsts, _srcs):
+            raise AssertionError("stride-unsafe NPU group must not use foreach copy")
+
+        copy_mod._tensor_device_type = lambda _tensor: "npu"
+        copy_mod._probe_npu_foreach_copy = lambda _device: True
+        torch._foreach_copy_ = fail_foreach_copy
+        try:
+            dst_base = torch.zeros(2, 4, dtype=torch.int64)
+            src_base = torch.arange(8, dtype=torch.int64).reshape(2, 4)
+            dsts = [dst_base[:, :2], torch.zeros(2, 2, dtype=torch.int64)]
+            srcs = [src_base[:, :2], torch.ones(2, 2, dtype=torch.int64)]
+
+            _grouped_foreach_copy_(dsts, srcs, ["non_contig", "contig"])
+        finally:
+            copy_mod._tensor_device_type = old_tensor_device_type
+            copy_mod._probe_npu_foreach_copy = old_probe
+            torch._foreach_copy_ = old_foreach_copy
+            self._restore_foreach_env(old_env)
+
+        self.assertTrue(torch.equal(dsts[0], srcs[0]))
+        self.assertTrue(torch.equal(dsts[1], srcs[1]))
+
+    def test_npu_on_mode_probe_failure_is_fail_fast(self):
+        old_env = self._set_foreach_env("on")
+        old_tensor_device_type = copy_mod._tensor_device_type
+        old_probe = copy_mod._probe_npu_foreach_copy
+
+        copy_mod._tensor_device_type = lambda _tensor: "npu"
+        copy_mod._probe_npu_foreach_copy = lambda _device: False
+        try:
+            dsts = [torch.zeros(4, dtype=torch.int64) for _ in range(2)]
+            srcs = [torch.ones(4, dtype=torch.int64) for _ in range(2)]
+
+            with self.assertRaisesRegex(
+                RuntimeError, "SGLANG_NPU_GRAPH_COPY_FOREACH=on"
+            ):
+                _grouped_foreach_copy_(dsts, srcs, ["a", "b"])
+        finally:
+            copy_mod._tensor_device_type = old_tensor_device_type
+            copy_mod._probe_npu_foreach_copy = old_probe
+            self._restore_foreach_env(old_env)
 
 
 class TestFillFromAndExtract(unittest.TestCase):
@@ -577,6 +744,49 @@ class TestSliceFnSlot(unittest.TestCase):
         )
         self.assertEqual(fb_view.mrope_positions.shape, (3, 8))
 
+    def test_fill_slices_padded_source_to_raw_tokens(self):
+        r = _make_registry(max_bs=4, max_num_tokens=8)
+        r.register_slot(
+            GraphSlot(
+                name="input_ids",
+                shape_fn=lambda bs, mt: (mt,),
+                dtype=torch.int64,
+                axis="tokens",
+            )
+        )
+        r.register_slot(
+            GraphSlot(
+                name="mrope_positions",
+                shape_fn=lambda bs, mt: (3, mt),
+                dtype=torch.int64,
+                axis="tokens",
+                slice_fn=lambda buf, n: buf[:, :n],
+            )
+        )
+        fb = _MiniForwardBatch(
+            batch_size=2,
+            input_ids=torch.arange(8, dtype=torch.int64),
+            mrope_positions=torch.arange(24, dtype=torch.int64).reshape(3, 8),
+        )
+
+        r.fill_from(
+            fb,
+            raw_bs=2,
+            padded_bs=2,
+            raw_num_tokens=4,
+            padded_num_tokens=4,
+        )
+
+        self.assertTrue(
+            torch.equal(r.get_slot("input_ids").buffer[:4], fb.input_ids[:4])
+        )
+        self.assertTrue(
+            torch.equal(
+                r.get_slot("mrope_positions").buffer[:, :4],
+                fb.mrope_positions[:, :4],
+            )
+        )
+
 
 class TestSourceFnSlots(unittest.TestCase):
     """``source_fn`` slots copy from a nested FB field or a side input, with a
@@ -634,6 +844,34 @@ class TestSourceFnSlots(unittest.TestCase):
         fb = _MiniForwardBatch(batch_size=3, ngram_embedding_info=None)
         r.fill_from(fb, raw_bs=3, padded_bs=8, raw_num_tokens=3, padded_num_tokens=16)
         self.assertTrue(torch.all(buf == 7))  # untouched
+
+    def test_source_fn_slices_oversized_source_to_buffer_shape(self):
+        r = _make_registry(max_bs=4, max_num_tokens=8)
+        r.register_slot(
+            GraphSlot(
+                name="ngram_embedding_info.column_starts",
+                shape_fn=lambda _bs, _mt: (4,),
+                dtype=torch.int32,
+                axis="none",
+                padding_policy=PaddingPolicy.KEEP_PAD,
+                source_fn=lambda fb, ctx: fb.ngram_embedding_info.column_starts,
+            )
+        )
+        fb = _MiniForwardBatch(
+            batch_size=4,
+            ngram_embedding_info=SimpleNamespace(
+                column_starts=torch.arange(8, dtype=torch.int32),
+            ),
+        )
+
+        r.fill_from(fb, raw_bs=4, padded_bs=4, raw_num_tokens=4, padded_num_tokens=4)
+
+        self.assertTrue(
+            torch.equal(
+                r.get_slot("ngram_embedding_info.column_starts").buffer,
+                torch.arange(4, dtype=torch.int32),
+            )
+        )
 
     def test_side_input_source_via_fill_context(self):
         r = _make_registry(max_bs=8, max_num_tokens=16)
@@ -904,12 +1142,11 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             )
 
     def test_num_token_non_padded_gathered_dp_branch(self):
-        import unittest.mock as mock
 
-        from sglang.srt.model_executor import forward_batch_info as fbi
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
             build_decode_registry,
         )
+        from sglang.srt.runtime_context import get_parallel
 
         ntnp = torch.zeros(1, dtype=torch.int32)
         src = SimpleNamespace(
@@ -926,9 +1163,7 @@ class TestBuildDecodeRegistry(unittest.TestCase):
         )
         # Gathered (DP) path: post_fill overwrites the FB copy with the local
         # count. Pin attn-TP (size=2, rank=0) so the result is deterministic.
-        with mock.patch.object(
-            fbi, "get_attention_tp_size", return_value=2
-        ), mock.patch.object(fbi, "get_attention_tp_rank", return_value=0):
+        with get_parallel().override(attn_tp_size=2, attn_tp_rank=0):
             reg = build_decode_registry(
                 device=torch.device("cpu"),
                 max_bs=4,
@@ -1396,6 +1631,33 @@ class TestComputedSlots(unittest.TestCase):
         )
         reg.fill_from(fb, raw_bs=2, padded_bs=2, raw_num_tokens=2, padded_num_tokens=2)
         # Non-gathered: plain FB copy, post_fill is a no-op.
+        self.assertTrue(
+            torch.equal(
+                reg.get_slot("num_token_non_padded").buffer,
+                torch.tensor([7], dtype=torch.int32),
+            )
+        )
+
+    def test_num_token_non_padded_scalar_copy_path(self):
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_decode_registry,
+        )
+
+        reg = build_decode_registry(
+            device=torch.device("cpu"),
+            max_bs=4,
+            max_num_token=8,
+            seq_len_fill_value=5,
+            cache_loc_dtype=torch.int64,
+            enable_num_token_non_padded=True,
+            require_gathered_buffer=False,
+        )
+        fb = _MiniForwardBatch(
+            batch_size=2,
+            num_token_non_padded=torch.tensor(7, dtype=torch.int32),
+        )
+        reg.fill_from(fb, raw_bs=2, padded_bs=2, raw_num_tokens=2, padded_num_tokens=2)
+
         self.assertTrue(
             torch.equal(
                 reg.get_slot("num_token_non_padded").buffer,

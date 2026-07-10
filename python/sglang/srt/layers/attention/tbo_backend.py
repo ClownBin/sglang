@@ -133,6 +133,17 @@ class TboAttnBackend(AttentionBackend):
             assert ans == child.get_cuda_graph_seq_len_fill_value()
         return ans
 
+    def can_skip_npu_graph_seq_lens_update(self, forward_batch: "ForwardBatch") -> bool:
+        return self.primary.can_skip_npu_graph_seq_lens_update(forward_batch)
+
+    def get_verify_buffers_to_fill_after_draft(self):
+        return self.primary.get_verify_buffers_to_fill_after_draft()
+
+    def update_verify_buffers_to_fill_after_draft(self, spec_info, cuda_graph_bs=None):
+        return self.primary.update_verify_buffers_to_fill_after_draft(
+            spec_info, cuda_graph_bs
+        )
+
     def forward(self, *args, **kwargs):
         return self.primary.forward(*args, **kwargs)
 
@@ -181,6 +192,11 @@ def _build_tbo_child_replay_fb_view(
     child_seq_lens_cpu = fb_view.seq_lens_cpu[seq_slice]
     parent_input_ids = getattr(fb_view, "input_ids", None)
     parent_out_cache_loc = getattr(fb_view, "out_cache_loc", None)
+
+    def _slice_seq_attr(name: str):
+        value = getattr(fb_view, name, None)
+        return value[seq_slice] if value is not None else None
+
     return SimpleNamespace(
         batch_size=child_bs,
         forward_mode=fb_view.forward_mode,
@@ -200,5 +216,9 @@ def _build_tbo_child_replay_fb_view(
             if parent_out_cache_loc is not None
             else None
         ),
+        extend_prefix_lens=_slice_seq_attr("extend_prefix_lens"),
+        extend_seq_lens=_slice_seq_attr("extend_seq_lens"),
+        extend_prefix_lens_cpu=_slice_seq_attr("extend_prefix_lens_cpu"),
+        extend_seq_lens_cpu=_slice_seq_attr("extend_seq_lens_cpu"),
         spec_info=child_spec_info,
     )

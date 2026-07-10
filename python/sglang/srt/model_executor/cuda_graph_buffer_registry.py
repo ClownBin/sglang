@@ -32,37 +32,35 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.model_executor.graph_buffer_copy import (
+    GraphBufferCopyEntry,
+    GraphBufferCopyPlanner,
+    _grouped_foreach_copy_,
+)
 from sglang.srt.model_executor.input_buffers import share_input_buffer
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-_has_foreach_copy = hasattr(torch, "_foreach_copy_")
-
-
-def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
-    """Call torch._foreach_copy_ grouped by (dst_dtype, src_dtype) pairs
-    (a single foreach call requires a uniform dtype pair)."""
-
-    def _foreach_copy(
-        group_dsts: List[torch.Tensor], group_srcs: List[torch.Tensor]
-    ) -> None:
-        if _has_foreach_copy:
-            torch._foreach_copy_(group_dsts, group_srcs)
-        else:
-            for dst, src in zip(group_dsts, group_srcs):
-                dst.copy_(src)
-
-    groups: Dict[Tuple[torch.dtype, torch.dtype], Tuple[List, List]] = {}
-    for dst, src in zip(dsts, srcs):
-        key = (dst.dtype, src.dtype)
-        if key not in groups:
-            groups[key] = ([], [])
-        groups[key][0].append(dst)
-        groups[key][1].append(src)
-    for group_dsts, group_srcs in groups.values():
-        _foreach_copy(group_dsts, group_srcs)
+def _slice_src_to_dst_shape(
+    src: torch.Tensor, dst: torch.Tensor, slot_name: str
+) -> torch.Tensor:
+    if tuple(src.shape) == tuple(dst.shape):
+        return src
+    if src.numel() == dst.numel():
+        return src.reshape(dst.shape)
+    if src.dim() != dst.dim():
+        raise RuntimeError(
+            f"GraphSlot {slot_name!r}: cannot copy src shape {tuple(src.shape)} "
+            f"to dst shape {tuple(dst.shape)} because ranks differ."
+        )
+    if any(src_size < dst_size for src_size, dst_size in zip(src.shape, dst.shape)):
+        raise RuntimeError(
+            f"GraphSlot {slot_name!r}: cannot copy src shape {tuple(src.shape)} "
+            f"to larger dst shape {tuple(dst.shape)}."
+        )
+    return src[tuple(slice(0, dst_size) for dst_size in dst.shape)]
 
 
 class PaddingPolicy(Enum):
@@ -305,6 +303,7 @@ class CudaGraphBufferRegistry:
         # when allocating (bind/source bypasses the pool).
         self.share_pool = share_pool
         self._slots: Dict[str, GraphSlot] = {}
+        self._copy_planner = GraphBufferCopyPlanner()
 
     # ---- registration ------------------------------------------------------
 
@@ -419,10 +418,7 @@ class CudaGraphBufferRegistry:
             slot.reset_padding(raw_n, padded_n)
 
         # Phase 2: collect (dst, src) pairs and dispatch a grouped copy.
-        gpu_dsts: List[torch.Tensor] = []
-        gpu_srcs: List[torch.Tensor] = []
-        cpu_dsts: List[torch.Tensor] = []
-        cpu_srcs: List[torch.Tensor] = []
+        copy_entries: List[GraphBufferCopyEntry] = []
         for slot in self._slots.values():
             if not slot.enabled or slot.buffer is None or not slot.copy_from_fb:
                 continue
@@ -445,22 +441,15 @@ class CudaGraphBufferRegistry:
                 raw_n = slot._raw_n(raw_bs, raw_num_tokens)
                 if slot.slice_fn is not None:
                     dst = slot.slice_fn(slot.buffer, raw_n)
+                    src = slot.slice_fn(src, raw_n)
                 elif slot.axis == "none":
                     dst = slot.buffer
                 else:
                     dst = slot.buffer[:raw_n]
-            # foreach_copy_ requires same-device tensors per call — bucket
-            # by device.
-            if dst.device.type == "cpu":
-                cpu_dsts.append(dst)
-                cpu_srcs.append(src)
-            else:
-                gpu_dsts.append(dst)
-                gpu_srcs.append(src)
-        if gpu_dsts:
-            _grouped_foreach_copy_(gpu_dsts, gpu_srcs)
-        for dst, src in zip(cpu_dsts, cpu_srcs):
-            dst.copy_(src)
+                    src = src[:raw_n]
+            src = _slice_src_to_dst_shape(src, dst, slot.name)
+            copy_entries.append(GraphBufferCopyEntry(name=slot.name, dst=dst, src=src))
+        self._copy_planner.copy(copy_entries)
 
         # Phase 3: post-fill hooks (compute-then-write slots).
         for slot in self._slots.values():
@@ -799,7 +788,7 @@ def build_prefill_registry(
     carried from the batch (a read input) rather than written in-graph.
 
     Padding policies match the inline copy/zero in
-    ``PiecewiseCudaGraphRunner.replay_prepare``: ``input_ids`` / ``positions``
+    ``PiecewiseCudaGraphRunner.load_batch``: ``input_ids`` / ``positions``
     / ``out_cache_loc`` / ``mrope_positions`` / ``input_embeds`` reset their
     padded tail ``[raw_num_tokens:padded_num_tokens]`` to ``0`` (the padded
     tokens *are* processed by the graph, so they must be benign), then the head
@@ -887,3 +876,48 @@ def build_prefill_registry(
                 )
         reg.register_slot(slot, bind=bind)
     return reg
+
+
+def build_eager_registry(
+    *,
+    device: torch.device,
+    max_bs: int,
+    max_num_token: int,
+    cache_loc_dtype: torch.dtype,
+    enable_mamba_track: bool = False,
+    is_encoder_decoder: bool = False,
+    encoder_len_fill_value: int = 0,
+    dp_size: int = 1,
+) -> CudaGraphBufferRegistry:
+    """One fixed-max input registry for the ``EagerRunner``, serving BOTH eager
+    decode and eager prefill.
+
+    The decode slot set is a superset of eager prefill's needs (eager prefill
+    carries ``input_embeds`` from the batch and reads the bs-axis fields live),
+    so we reuse it, sized at ``(max_bs, max_num_token)`` where ``max_num_token``
+    is the prefill token ceiling. ``seq_len_fill_value=0`` because eager never
+    pads, so the sentinel tail is never read.
+
+    ``share_pool=True`` so same-named / same-size slots coalesce through the
+    process-wide pool. The ``EagerRunner`` is built before the cuda-graph runners
+    (see ``ModelRunner.init_backends``), so its (largest) allocations are
+    canonical and the cg runners' matching slots (prefill's token-axis at
+    ``max_num_token``, decode's bs-axis at ``max_bs``) adopt them.
+    """
+    return build_decode_registry(
+        device=device,
+        max_bs=max_bs,
+        max_num_token=max_num_token,
+        seq_len_fill_value=0,
+        cache_loc_dtype=cache_loc_dtype,
+        enable_mamba_track=enable_mamba_track,
+        is_encoder_decoder=is_encoder_decoder,
+        encoder_len_fill_value=encoder_len_fill_value,
+        enable_num_token_non_padded=False,
+        register_global_num_tokens=False,
+        require_gathered_buffer=False,
+        require_mlp_tp_gather=False,
+        dp_size=dp_size,
+        share_pool=True,
+        source=None,
+    )

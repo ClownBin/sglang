@@ -31,6 +31,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -155,6 +156,8 @@ if _is_npu:
     import torch_npu
     from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
 
+_NPU_GEMMA_RMS_NORM_TRITON_MAX_HIDDEN_SIZE = 5120
+
 
 def _forward_with_allreduce_fusion(
     norm_module,
@@ -167,9 +170,6 @@ def _forward_with_allreduce_fusion(
     """Shared allreduce-fused RMSNorm logic usable by any norm."""
     if residual is not None:
         from sglang.srt.distributed import (
-            get_attn_tensor_model_parallel_world_size,
-            get_moe_expert_parallel_world_size,
-            get_moe_tensor_parallel_world_size,
             tensor_model_parallel_all_reduce,
             tensor_model_parallel_fused_allreduce_rmsnorm,
         )
@@ -178,12 +178,12 @@ def _forward_with_allreduce_fusion(
         )
 
         if use_attn_tp_group:
-            world_size = get_attn_tensor_model_parallel_world_size()
+            world_size = get_parallel().attn_tp_size
         else:
-            if get_moe_expert_parallel_world_size() > 1:
-                world_size = get_moe_expert_parallel_world_size()
+            if get_parallel().moe_ep_size > 1:
+                world_size = get_parallel().moe_ep_size
             else:
-                world_size = get_moe_tensor_parallel_world_size()
+                world_size = get_parallel().moe_tp_size
 
         if world_size > 1:
             if post_residual_addition is not None:
@@ -799,6 +799,20 @@ class GemmaRMSNorm(MultiPlatformOp):
             )
         return self.forward_native(x, residual, post_residual_addition)
 
+    def _forward_npu_unfused_residual(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if post_residual_addition is not None:
+            residual = residual + post_residual_addition
+        residual = x + residual
+        norm_out, _ = torch_npu.npu_gemma_rms_norm(
+            residual, self.weight, self.variance_epsilon
+        )
+        return norm_out, residual
+
     def forward_npu(
         self,
         x: torch.Tensor,
@@ -806,8 +820,14 @@ class GemmaRMSNorm(MultiPlatformOp):
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if envs.SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM.get():
-            return self.forward_native(x, residual)
+            return self.forward_native(x, residual, post_residual_addition)
         if residual is not None:
+            if x.shape[-1] > _NPU_GEMMA_RMS_NORM_TRITON_MAX_HIDDEN_SIZE:
+                # MiniMax-M3 hidden_size=6144 overflows UB in sgl_kernel_npu's
+                # Triton fused residual+GemmaRMSNorm kernel on Ascend.
+                return self._forward_npu_unfused_residual(
+                    x, residual, post_residual_addition
+                )
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
             norm_out, residual = add_gemma_rms_norm(

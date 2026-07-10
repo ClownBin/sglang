@@ -38,6 +38,10 @@ class AttentionBackend(ABC):
     those must migrate to ``init_forward_metadata_out_graph(fb, in_capture)``.
     """
 
+    # Resolved per-mode backend names, stamped by ModelRunner.init_attention_backend
+    prefill_attention_backend_str: Optional[str] = None
+    decode_attention_backend_str: Optional[str] = None
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
 
@@ -84,6 +88,10 @@ class AttentionBackend(ABC):
 
     # Opt out only when this backend never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = True
+
+    def can_skip_npu_graph_seq_lens_update(self, forward_batch: ForwardBatch) -> bool:
+        """Whether NPU graph replay can skip NPUGraph.update for seq lengths."""
+        return False
 
     # Most attention backends can rebuild and replace forward metadata before
     # every forward. BCG capture is different: some backends expose metadata

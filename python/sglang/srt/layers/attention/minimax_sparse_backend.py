@@ -1770,6 +1770,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 )
                 idx_o, o = idx_o_t, o_t
             else:
+                prefill_meta = self._build_npu_sparse_prefill_meta(
+                    forward_batch, cu_seqlens, seq_lens, prefix_lens
+                )
                 idx_o, o = self._forward_npu_sparse_prefill(
                     q,
                     k_cache,

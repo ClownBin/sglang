@@ -34,6 +34,13 @@ _SPARSE_DECODE_NS = 2
 _MERGE_NW = 4
 _MERGE_NS = 2
 
+# MiniMax-M3 selects 16 scored blocks and appends one forced local block.  On
+# Ascend, the resulting short TopK list is launch/merge bound for C1 decode and
+# target verification.  Keep small batches in the single-chunk fast path, which
+# avoids the partial-output allocation and merge-kernel launch entirely.
+_MINIMAX_SINGLE_CHUNK_MAX_TOPK = 17
+_MINIMAX_SINGLE_CHUNK_MAX_BATCH = 4
+
 
 def _get_vectorcore_num_safe() -> int:
     """Return the Ascend NPU vector-core count (sglang-native).
@@ -60,6 +67,13 @@ def _choose_num_topk_chunks(
 ) -> int:
     """Choose split-topk chunks in an SGLang-like but Ascend-conservative way."""
     if max_topk <= 1:
+        return 1
+
+    if (
+        num_kv_heads == 1
+        and batch_size <= _MINIMAX_SINGLE_CHUNK_MAX_BATCH
+        and max_topk <= _MINIMAX_SINGLE_CHUNK_MAX_TOPK
+    ):
         return 1
 
     num_vectorcore = _get_vectorcore_num_safe()

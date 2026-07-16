@@ -103,6 +103,12 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _device_sm = get_device_sm()
 
+if _is_npu:
+    from sglang.srt.hardware_backend.npu.utils import (
+        process_shared_expert,
+        wait_share_stream,
+    )
+
 # fp8 main-K/V cache dtypes (index cache always stays bf16). When the sparse
 # pool is one of these, the bf16-only qknorm+rope+kv-insert fusion is skipped so
 # the backend's set_kv_buffer performs the bf16->fp8 cache write instead.
@@ -479,9 +485,22 @@ class MiniMaxM3MoE(nn.Module):
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
         shared_output = None
+        enable_npu_dual_stream = (
+            _is_npu
+            and (
+                forward_batch.forward_mode.is_extend()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+            and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+        )
         if hidden_states.shape[0] > 0:
-            shared_output = self._forward_shared_experts(hidden_states)
             router_logits = self._compute_router_logits(hidden_states)
+            if enable_npu_dual_stream:
+                shared_output = process_shared_expert(
+                    hidden_states, self._forward_shared_experts
+                )
+            else:
+                shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -497,6 +516,9 @@ class MiniMaxM3MoE(nn.Module):
         # here, unlike forward_normal), and the shared experts are replicated
         # (tp_size=1, see __init__), so both are complete per token and add directly.
         final_hidden_states = self.experts(hidden_states, topk_output)
+
+        if enable_npu_dual_stream:
+            wait_share_stream()
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output

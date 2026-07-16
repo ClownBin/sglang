@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton import (
 from sglang.srt.layers.attention.minimax_sparse_backend import (
     MiniMaxSparseAttnBackend,
 )
+from sglang.srt.models import minimax_m3
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -205,6 +206,70 @@ def _direct_page_map_from_block_table(
 
 
 class TestMiniMaxSparseDecodeTopKTriton(CustomTestCase):
+    def test_deepep_target_verify_overlaps_shared_expert_on_npu(self):
+        hidden_states = torch.randn(2, 8, dtype=torch.bfloat16, device=_DEVICE)
+        shared_output = torch.randn_like(hidden_states)
+        routed_output = torch.randn_like(hidden_states)
+        router_logits = torch.randn(2, 4, dtype=torch.float32, device=_DEVICE)
+        topk_output = object()
+        moe = MagicMock()
+        moe.layer_id = 7
+        moe._compute_router_logits.return_value = router_logits
+        moe.topk.return_value = topk_output
+        moe.experts.return_value = routed_output
+        forward_batch = SimpleNamespace(
+            num_token_non_padded=2,
+            forward_mode=SimpleNamespace(
+                is_extend=lambda: False,
+                is_target_verify=lambda: True,
+            ),
+        )
+
+        with patch.object(minimax_m3, "_is_npu", True), patch.object(
+            minimax_m3.envs.SGLANG_NPU_USE_MULTI_STREAM,
+            "get",
+            return_value=True,
+        ), patch.object(
+            minimax_m3.ExpertLocationDispatchInfo,
+            "init_new",
+            return_value=None,
+        ), patch.object(
+            minimax_m3,
+            "process_shared_expert",
+            return_value=shared_output,
+        ) as process_shared_expert, patch.object(
+            minimax_m3,
+            "wait_share_stream",
+        ) as wait_share_stream:
+            actual = minimax_m3.MiniMaxM3MoE.forward_deepep(
+                moe, hidden_states, forward_batch
+            )
+
+        process_shared_expert.assert_called_once_with(
+            hidden_states, moe._forward_shared_experts
+        )
+        wait_share_stream.assert_called_once()
+        torch.testing.assert_close(actual, routed_output + shared_output)
+
+    def test_chunk_selection_uses_single_chunk_for_minimax_c1_shape(self):
+        with patch.object(sparse_decode, "_get_vectorcore_num_safe", return_value=32):
+            self.assertEqual(
+                sparse_decode._choose_num_topk_chunks(
+                    batch_size=4,
+                    num_kv_heads=1,
+                    max_topk=17,
+                ),
+                1,
+            )
+            self.assertEqual(
+                sparse_decode._choose_num_topk_chunks(
+                    batch_size=8,
+                    num_kv_heads=1,
+                    max_topk=17,
+                ),
+                8,
+            )
+
     def test_prefill_metadata_keeps_direct_request_map_without_block_table(self):
         backend = object.__new__(MiniMaxSparseAttnBackend)
         backend._max_seqlen_k = 384

@@ -312,6 +312,19 @@ def _gqa_share_sparse_decode_bnsd_kernel(
     BLOCK_SIZE_T: tl.constexpr,
     NUM_TOPK_CHUNKS: tl.constexpr,
     CHUNK_SIZE_T: tl.constexpr,
+    # Number of selected (topk) blocks gathered into one K/V tile + one dot per
+    # loop step. 1 == the original per-block path (bit-identical). 2/4 amortise
+    # the per-step scalar overhead (idx gather, page lookup, address math,
+    # softmax update) that leaves the prefill main-attention launch
+    # overhead-bound at total_q~3072. Same block set per query -> same math,
+    # only the online-softmax grouping changes (fp-tail level).
+    BLOCKS_PER_STEP: tl.constexpr,
+    # Hoist the whole chunk's topk-idx load + page-id gather into a vectorized
+    # prologue ([BLOCK_SIZE_T] lanes, one memory round trip) and recover the
+    # per-step scalars with a where+sum select, instead of the per-step serial
+    # idx-load -> page-gather -> K-load dependency chain. Same blocks, same
+    # order, same math -- only address generation is restructured.
+    PREFETCH_IDX: tl.constexpr,
     HAS_SINK: tl.constexpr,
     USE_DIRECT_PAGE_LOOKUP: tl.constexpr,
     SANITIZE_PAGE_IDS: tl.constexpr,
@@ -381,94 +394,249 @@ def _gqa_share_sparse_decode_bnsd_kernel(
     # in-loop (simpler; no benefit to hoist).
     # Iterate over the fixed topk slice assigned to this chunk. The actual valid
     # length is encoded by -1 sentinels in topk_idx.
-    for step in tl.range(CHUNK_SIZE_T):
-        topk_pos = chunk_start_topk + step
-        in_topk_range = topk_pos < max_topk
-
-        logical_block = tl.load(
-            idx_base + topk_pos * stride_ti_t,
-            mask=in_topk_range,
-            other=-1,
-        ).to(tl.int32)
-        valid_block = logical_block >= 0
-
-        if USE_DIRECT_PAGE_LOOKUP:
-            req_idx = tl.load(req_pool_indices_ptr + pid_b).to(tl.int64)
-            safe_logical_block = tl.maximum(logical_block, 0)
-            token_col = tl.minimum(
-                safe_logical_block * block_size, max_req_to_token_cols - 1
-            )
-            token_slot = tl.load(
-                req_to_token_ptr
-                + req_idx * stride_rtt_r
-                + token_col * stride_rtt_t,
-                mask=valid_block,
-                other=0,
-            ).to(tl.int64)
-            physical_block = token_slot // block_size
-            if SANITIZE_PAGE_IDS:
-                physical_block = tl.minimum(
-                    tl.maximum(physical_block, 0), num_pages - 1
+    if BLOCKS_PER_STEP == 1:
+        off_t_pf = tl.arange(0, BLOCK_SIZE_T)
+        if PREFETCH_IDX:
+            # Vectorized prologue: one gather for all of this chunk's selected
+            # blocks, one for their physical page ids. Afterwards the K/V loads
+            # in the loop depend only on register data, so the memory pipeline
+            # can run ahead instead of serializing idx->page->K per step.
+            chunk_end_topk_pf = tl.minimum(chunk_start_topk + CHUNK_SIZE_T, max_topk)
+            topk_pos_all = chunk_start_topk + off_t_pf
+            logical_all = tl.load(
+                idx_base + topk_pos_all * stride_ti_t,
+                mask=topk_pos_all < chunk_end_topk_pf,
+                other=-1,
+            ).to(tl.int32)
+            valid_pf = logical_all >= 0
+            safe_pf = tl.maximum(logical_all, 0)
+            if USE_DIRECT_PAGE_LOOKUP:
+                req_idx_pf = tl.load(req_pool_indices_ptr + pid_b).to(tl.int64)
+                token_cols_pf = tl.minimum(
+                    safe_pf * block_size, max_req_to_token_cols - 1
                 )
-        else:
-            physical_block = tl.load(
-                block_table_ptr + pid_b * stride_bt_b + logical_block * stride_bt_n,
-                mask=valid_block,
-                other=0,
-            ).to(tl.int64)
+                token_slots_pf = tl.load(
+                    req_to_token_ptr
+                    + req_idx_pf * stride_rtt_r
+                    + token_cols_pf * stride_rtt_t,
+                    mask=valid_pf,
+                    other=0,
+                ).to(tl.int64)
+                phys_pf = token_slots_pf // block_size
+                if SANITIZE_PAGE_IDS:
+                    phys_pf = tl.minimum(tl.maximum(phys_pf, 0), num_pages - 1)
+            else:
+                phys_pf = tl.load(
+                    block_table_ptr + pid_b * stride_bt_b + safe_pf * stride_bt_n,
+                    mask=valid_pf,
+                    other=0,
+                ).to(tl.int64)
+            phys_pf32 = phys_pf.to(tl.int32)
+        for step in tl.range(CHUNK_SIZE_T):
+            if PREFETCH_IDX:
+                # Dynamic register-vector index via where+sum ([T] int ops).
+                logical_block = tl.sum(
+                    tl.where(off_t_pf == step, logical_all, 0), axis=0
+                )
+                physical_block = tl.sum(
+                    tl.where(off_t_pf == step, phys_pf32, 0), axis=0
+                ).to(tl.int64)
+                valid_block = logical_block >= 0
+            else:
+                topk_pos = chunk_start_topk + step
+                in_topk_range = topk_pos < max_topk
 
-        pos = logical_block * block_size + off_n
-        pos_mask = valid_block & (pos < seq_len)
+                logical_block = tl.load(
+                    idx_base + topk_pos * stride_ti_t,
+                    mask=in_topk_range,
+                    other=-1,
+                ).to(tl.int32)
+                valid_block = logical_block >= 0
 
-        # K: [D, N]
-        k_offsets = (
-            physical_block * stride_k_block
-            + off_n[None, :] * stride_k_offset
-            + pid_kh * stride_k_h
-            + off_d[:, None] * stride_k_d
-        )
-        k = tl.load(
-            k_cache_ptr + k_offsets,
-            mask=dim_mask[:, None] & pos_mask[None, :],
-            other=0.0,
-        )
+                if USE_DIRECT_PAGE_LOOKUP:
+                    req_idx = tl.load(req_pool_indices_ptr + pid_b).to(tl.int64)
+                    safe_logical_block = tl.maximum(logical_block, 0)
+                    token_col = tl.minimum(
+                        safe_logical_block * block_size, max_req_to_token_cols - 1
+                    )
+                    token_slot = tl.load(
+                        req_to_token_ptr
+                        + req_idx * stride_rtt_r
+                        + token_col * stride_rtt_t,
+                        mask=valid_block,
+                        other=0,
+                    ).to(tl.int64)
+                    physical_block = token_slot // block_size
+                    if SANITIZE_PAGE_IDS:
+                        physical_block = tl.minimum(
+                            tl.maximum(physical_block, 0), num_pages - 1
+                        )
+                else:
+                    physical_block = tl.load(
+                        block_table_ptr
+                        + pid_b * stride_bt_b
+                        + logical_block * stride_bt_n,
+                        mask=valid_block,
+                        other=0,
+                    ).to(tl.int64)
 
-        # V: [N, D]
-        v_offsets = (
-            physical_block * stride_v_block
-            + off_n[:, None] * stride_v_offset
-            + pid_kh * stride_v_h
-            + off_d[None, :] * stride_v_d
-        )
-        v = tl.load(
-            v_cache_ptr + v_offsets,
-            mask=pos_mask[:, None] & dim_mask[None, :],
-            other=0.0,
-        )
+            pos = logical_block * block_size + off_n
+            pos_mask = valid_block & (pos < seq_len)
 
-        # [H, D] @ [D, N] -> [H, N]
-        qk = tl.dot(q, k) * sm_scale
-        qk = tl.where(pos_mask[None, :], qk, float("-inf"))
+            # K: [D, N]
+            k_offsets = (
+                physical_block * stride_k_block
+                + off_n[None, :] * stride_k_offset
+                + pid_kh * stride_k_h
+                + off_d[:, None] * stride_k_d
+            )
+            k = tl.load(
+                k_cache_ptr + k_offsets,
+                mask=dim_mask[:, None] & pos_mask[None, :],
+                other=0.0,
+            )
 
-        m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-        p = tl.where(
-            valid_block,
-            tl.exp(qk - m_ij[:, None]),
-            tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_N), dtype=tl.float32),
-        )
-        l_ij = tl.sum(p, axis=1)
+            # V: [N, D]
+            v_offsets = (
+                physical_block * stride_v_block
+                + off_n[:, None] * stride_v_offset
+                + pid_kh * stride_v_h
+                + off_d[None, :] * stride_v_d
+            )
+            v = tl.load(
+                v_cache_ptr + v_offsets,
+                mask=pos_mask[:, None] & dim_mask[None, :],
+                other=0.0,
+            )
 
-        acc_o_scale = tl.where(
-            valid_block,
-            tl.exp(m_i - m_ij),
-            tl.full((BLOCK_SIZE_H,), 1.0, dtype=tl.float32),
-        )
-        acc_o_new = acc_o * acc_o_scale[:, None] + tl.dot(p.to(v.dtype), v)
-        lse_i_new = m_ij + tl.log(tl.exp(lse_i - m_ij) + l_ij)
+            # [H, D] @ [D, N] -> [H, N]
+            qk = tl.dot(q, k) * sm_scale
+            qk = tl.where(pos_mask[None, :], qk, float("-inf"))
 
-        acc_o = tl.where(valid_block, acc_o_new, acc_o)
-        m_i = tl.where(valid_block, m_ij, m_i)
-        lse_i = tl.where(valid_block, lse_i_new, lse_i)
+            m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+            p = tl.where(
+                valid_block,
+                tl.exp(qk - m_ij[:, None]),
+                tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_N), dtype=tl.float32),
+            )
+            l_ij = tl.sum(p, axis=1)
+
+            acc_o_scale = tl.where(
+                valid_block,
+                tl.exp(m_i - m_ij),
+                tl.full((BLOCK_SIZE_H,), 1.0, dtype=tl.float32),
+            )
+            acc_o_new = acc_o * acc_o_scale[:, None] + tl.dot(p.to(v.dtype), v)
+            lse_i_new = m_ij + tl.log(tl.exp(lse_i - m_ij) + l_ij)
+
+            acc_o = tl.where(valid_block, acc_o_new, acc_o)
+            m_i = tl.where(valid_block, m_ij, m_i)
+            lse_i = tl.where(valid_block, lse_i_new, lse_i)
+    else:
+        # Multi-block path: gather BLOCKS_PER_STEP selected blocks into one
+        # [D, BPS*block_size] K tile / [BPS*block_size, D] V tile per step. All
+        # per-column vectors (Triton cannot index a [BPS] tensor by column), so
+        # the idx/page gathers are per-column (redundant x block_size but L2
+        # hits) -- the same trick as _prefill_bnsd_score_kernel's P3 path.
+        sub_id = off_n // block_size  # [N] which selected block in this step
+        inn = off_n % block_size  # [N] token offset within that block
+        chunk_end_topk = tl.minimum(chunk_start_topk + CHUNK_SIZE_T, max_topk)
+        num_steps = tl.cdiv(chunk_end_topk - chunk_start_topk, BLOCKS_PER_STEP)
+        for step in tl.range(num_steps, num_stages=1, disallow_acc_multi_buffer=True):
+            topk_pos_col = chunk_start_topk + step * BLOCKS_PER_STEP + sub_id
+            logical_block_col = tl.load(
+                idx_base + topk_pos_col * stride_ti_t,
+                mask=topk_pos_col < chunk_end_topk,
+                other=-1,
+            ).to(tl.int32)
+            valid_col = logical_block_col >= 0
+            safe_logical_col = tl.maximum(logical_block_col, 0)
+
+            if USE_DIRECT_PAGE_LOOKUP:
+                req_idx = tl.load(req_pool_indices_ptr + pid_b).to(tl.int64)
+                token_col = tl.minimum(
+                    safe_logical_col * block_size, max_req_to_token_cols - 1
+                )
+                token_slot = tl.load(
+                    req_to_token_ptr
+                    + req_idx * stride_rtt_r
+                    + token_col * stride_rtt_t,
+                    mask=valid_col,
+                    other=0,
+                ).to(tl.int64)
+                physical_block_col = token_slot // block_size
+                if SANITIZE_PAGE_IDS:
+                    physical_block_col = tl.minimum(
+                        tl.maximum(physical_block_col, 0), num_pages - 1
+                    )
+            else:
+                physical_block_col = tl.load(
+                    block_table_ptr
+                    + pid_b * stride_bt_b
+                    + safe_logical_col * stride_bt_n,
+                    mask=valid_col,
+                    other=0,
+                ).to(tl.int64)
+
+            pos = logical_block_col * block_size + inn
+            pos_mask = valid_col & (pos < seq_len)
+
+            # K: [D, BPS*block_size]
+            k_offsets = (
+                physical_block_col[None, :] * stride_k_block
+                + inn[None, :] * stride_k_offset
+                + pid_kh * stride_k_h
+                + off_d[:, None] * stride_k_d
+            )
+            k = tl.load(
+                k_cache_ptr + k_offsets,
+                mask=dim_mask[:, None] & pos_mask[None, :],
+                other=0.0,
+            )
+
+            # [H, D] @ [D, BPS*block_size] -> [H, BPS*block_size]
+            qk = tl.dot(q, k) * sm_scale
+            qk = tl.where(pos_mask[None, :], qk, float("-inf"))
+
+            # A step with at least one valid column behaves exactly like the
+            # per-block path on those columns (invalid columns stay -inf ->
+            # p=0); an all-invalid step must not touch the accumulator (it
+            # would produce -inf - -inf = nan), mirroring valid_block above.
+            has_valid = tl.sum(valid_col.to(tl.int32), axis=0) > 0
+            m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+            p = tl.where(
+                has_valid,
+                tl.exp(qk - m_ij[:, None]),
+                tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_N), dtype=tl.float32),
+            )
+            l_ij = tl.sum(p, axis=1)
+
+            # V load is sequenced AFTER the qk/p phase so its UB live range
+            # starts as K's ends (K and V tiles together overflow the 192KB UB
+            # at BLOCK_SIZE_N >= 256 otherwise).
+            v_offsets = (
+                physical_block_col[:, None] * stride_v_block
+                + inn[:, None] * stride_v_offset
+                + pid_kh * stride_v_h
+                + off_d[None, :] * stride_v_d
+            )
+            v = tl.load(
+                v_cache_ptr + v_offsets,
+                mask=pos_mask[:, None] & dim_mask[None, :],
+                other=0.0,
+            )
+
+            acc_o_scale = tl.where(
+                has_valid,
+                tl.exp(m_i - m_ij),
+                tl.full((BLOCK_SIZE_H,), 1.0, dtype=tl.float32),
+            )
+            acc_o_new = acc_o * acc_o_scale[:, None] + tl.dot(p.to(v.dtype), v)
+            lse_i_new = m_ij + tl.log(tl.exp(lse_i - m_ij) + l_ij)
+
+            acc_o = tl.where(has_valid, acc_o_new, acc_o)
+            m_i = tl.where(has_valid, m_ij, m_i)
+            lse_i = tl.where(has_valid, lse_i_new, lse_i)
 
     # Final scale.
     # Empty chunks keep lse_i=-inf and should output clean zeros.
@@ -606,6 +774,14 @@ def flash_decode_bnsd_with_gqa_share_sparse(
     max_num_blocks: Optional[int] = None,
     num_pages: Optional[int] = None,
     sanitize_page_ids: bool = False,
+    # Selected blocks fused into one K/V tile + dot per loop step (prefill
+    # main-attention anti-overhead lever; 1 keeps the validated per-block
+    # path). Must be a power of two so BLOCK_SIZE_N stays aligned.
+    topk_blocks_per_step: int = 1,
+    # Hoist the chunk's topk-idx + page-id gathers into a vectorized prologue
+    # (breaks the per-step idx->page->K load dependency chain). A/B lever for
+    # the latency/issue-bound prefill main-attention launch.
+    prefetch_idx: bool = False,
     num_warps: Optional[int] = None,
     num_stages: Optional[int] = None,
 ) -> torch.Tensor:
@@ -715,6 +891,12 @@ def flash_decode_bnsd_with_gqa_share_sparse(
     # This keeps correctness unchanged while avoiding the backend corner case.
     chunk_size_topk = max(2, chunk_size_topk)
 
+    blocks_per_step = max(1, int(topk_blocks_per_step))
+    assert (blocks_per_step & (blocks_per_step - 1)) == 0
+    # When several topk blocks are fused per step, the static loop width must
+    # cover at least one fused tile so every selected block is visited.
+    chunk_size_topk = max(chunk_size_topk, blocks_per_step)
+
     # Single-chunk fast path: with NUM_TOPK_CHUNKS==1 the decode kernel writes the
     # already-final-normalized output (it applies the final exp(m_i - lse_i) scale
     # before storing), so the merge kernel would be a no-op copy. Alias o_partial
@@ -792,9 +974,11 @@ def flash_decode_bnsd_with_gqa_share_sparse(
         lse_partial.stride(0),
         lse_partial.stride(1),
         lse_partial.stride(2),
-        BLOCK_SIZE_N=block_size,
+        BLOCK_SIZE_N=block_size * blocks_per_step,
         NUM_TOPK_CHUNKS=num_topk_chunks,
         CHUNK_SIZE_T=chunk_size_topk,
+        BLOCKS_PER_STEP=blocks_per_step,
+        PREFETCH_IDX=prefetch_idx and blocks_per_step == 1,
         HAS_SINK=sink is not None,
         USE_DIRECT_PAGE_LOOKUP=use_direct_page_lookup,
         SANITIZE_PAGE_IDS=sanitize_page_ids,

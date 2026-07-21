@@ -101,9 +101,11 @@ MINIMAX_NPU_TRITON_PREFILL_AUTO_MIN_SEQLEN = 20000
 #   KV=131K: 16=63.8ms  32=40.2ms  64=29.2ms (-54% vs 16)
 # BSQ=128 fails to compile (UB too large for [128,128] dot qk), so 64 is the cap.
 # Prior cap of 16 (64K threshold) was a conservative stop -- never benched 32/64.
-_BSQ_THRESHOLD_64 = 4096   # max_seqlen_k >= 4K  -> BSQ=64 (bench: -35%..-54% vs 16 across 4K-131K)
-_BSQ_THRESHOLD_32 = 1024   # max_seqlen_k >= 1K  -> BSQ=32
-_BSQ_THRESHOLD_16 = 512    # max_seqlen_k >= 512 -> BSQ=16
+_BSQ_THRESHOLD_64 = (
+    4096  # max_seqlen_k >= 4K  -> BSQ=64 (bench: -35%..-54% vs 16 across 4K-131K)
+)
+_BSQ_THRESHOLD_32 = 1024  # max_seqlen_k >= 1K  -> BSQ=32
+_BSQ_THRESHOLD_16 = 512  # max_seqlen_k >= 512 -> BSQ=16
 # BSQ<=64 is UB-safe for the prefill indexer: BLOCK_SIZE_H=next_pow2(gqa)=1 (not
 # padded to 16 like decode), so Q tile = [BSQ*1, 128] = up to 8KB at BSQ=64.
 
@@ -117,7 +119,9 @@ def _npu_triton_prefill_auto(seq_lens: torch.Tensor) -> bool:
     """
     if not _npu_use_triton_sparse():
         return False
-    return bool(int(seq_lens.max().item()) >= MINIMAX_NPU_TRITON_PREFILL_AUTO_MIN_SEQLEN)
+    return bool(
+        int(seq_lens.max().item()) >= MINIMAX_NPU_TRITON_PREFILL_AUTO_MIN_SEQLEN
+    )
 
 
 if TYPE_CHECKING:
@@ -304,6 +308,16 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         )
 
     @staticmethod
+    def _choose_decode_score_max_chunks(batch_size: int) -> int:
+        """Use the lower-latency score split only for the C1 graph bucket.
+
+        A3 full-layer graph A/B shows 16 chunks beats 32 for B1 at both 16K
+        and 128K. At B4/128K it regresses, so every larger graph bucket keeps
+        the validated 32-chunk route. Target verify has its own 64-chunk tuning.
+        """
+        return 16 if int(batch_size) == 1 else 32
+
+    @staticmethod
     def _choose_block_size_q(max_seqlen_k: int) -> int:
         """Pick block_size_q adaptively based on max KV sequence length.
 
@@ -351,7 +365,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     @staticmethod
     def _get_safe_block_size_q(
         max_seqlen_k: int,
-        extend_lens_cpu: "torch.Tensor | None" = None,
+        extend_lens_cpu: torch.Tensor | None = None,
     ) -> int:
         """Adaptive BSQ with cross-request contamination safety guard.
 
@@ -482,23 +496,29 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             if ndt:
                 prefix = (forward_batch.seq_lens.to(torch.long) - int(ndt)).clamp(min=0)
                 offsets = torch.arange(
-                    1, int(ndt) + 1, device=forward_batch.seq_lens.device, dtype=torch.long
+                    1,
+                    int(ndt) + 1,
+                    device=forward_batch.seq_lens.device,
+                    dtype=torch.long,
                 )
                 per_query_seq_lens = (
-                    (prefix.unsqueeze(1) + offsets.unsqueeze(0)).reshape(-1).to(torch.int32)
+                    (prefix.unsqueeze(1) + offsets.unsqueeze(0))
+                    .reshape(-1)
+                    .to(torch.int32)
                 )
                 per_query_req = forward_batch.req_pool_indices.long().repeat_interleave(
                     int(ndt)
                 )
-                self._verify_meta_cg[
-                    (forward_batch.seq_lens.shape[0], int(ndt))
-                ] = SimpleNamespace(
-                    per_query_seq_lens=per_query_seq_lens, per_query_req=per_query_req
+                self._verify_meta_cg[(forward_batch.seq_lens.shape[0], int(ndt))] = (
+                    SimpleNamespace(
+                        per_query_seq_lens=per_query_seq_lens,
+                        per_query_req=per_query_req,
+                    )
                 )
         elif fm.is_decode_or_idle():
-            self._decode_seq_lens_i32_cg[
-                forward_batch.seq_lens.shape[0]
-            ] = forward_batch.seq_lens.to(torch.int32)
+            self._decode_seq_lens_i32_cg[forward_batch.seq_lens.shape[0]] = (
+                forward_batch.seq_lens.to(torch.int32)
+            )
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         pass
@@ -663,9 +683,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         topk_2d = topk_idx.permute(1, 0, 2).contiguous()
         query_positions = (seq_lens.to(torch.long) - 1).clamp(min=0)
-        topk_merged = self._merge_sparse_blocks(
-            topk_2d, query_positions, max_blocks
-        )
+        topk_merged = self._merge_sparse_blocks(topk_2d, query_positions, max_blocks)
         return topk_merged.permute(1, 0, 2).contiguous()
 
     def _select_sparse_blocks(
@@ -1029,6 +1047,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.topk_sparse_decode import (
             flash_decode_bnsd_with_gqa_share_sparse,
         )
+
         page_size = self.page_size  # == block_size_k
         num_q_heads = q.shape[1]
         head_dim = q.shape[2]
@@ -1107,11 +1126,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             req_idx = forward_batch.req_pool_indices.long()
             max_cols = self.req_to_token.shape[1]
             blk_cols = (
-                torch.arange(max_blocks, device=q.device, dtype=torch.long)
-                * page_size
+                torch.arange(max_blocks, device=q.device, dtype=torch.long) * page_size
             ).clamp(max=max_cols - 1)
             token_slots = self.req_to_token[req_idx][:, blk_cols]
-            page_source_kwargs = dict(block_table=(token_slots // page_size).to(torch.int32))
+            page_source_kwargs = dict(
+                block_table=(token_slots // page_size).to(torch.int32)
+            )
 
         # 1) indexer: block scoring (idx_k) + index attention (idx_q/k/v) + topk.
         # Pass init_blocks=0, local_blocks=0 on purpose: the ported triton score
@@ -1140,6 +1160,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             sm_scale=idx_dim**-0.5,
             score_type=self.score_type,
             disable_index_value=disable_index_value,
+            runtime_fill_only=True,
+            score_max_chunks=self._choose_decode_score_max_chunks(bs),
         )
 
         # 2) Reduce heads and append forced blocks. MiniMax-M3 TP=16 uses the
@@ -1201,6 +1223,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.topk_sparse_decode import (
             flash_decode_bnsd_with_gqa_share_sparse,
         )
+
         page_size = self.page_size  # == block_size_k
         num_q_heads = q.shape[1]
         head_dim = q.shape[2]
@@ -1247,13 +1270,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         vmeta = self._verify_meta_cg.get((bs, ndt))
         if vmeta is None:
             prefix = (forward_batch.seq_lens.to(torch.long) - int(ndt)).clamp(min=0)
-            offsets = torch.arange(
-                1, int(ndt) + 1, device=q.device, dtype=torch.long
-            )
+            offsets = torch.arange(1, int(ndt) + 1, device=q.device, dtype=torch.long)
             per_query_seq_lens = (
-                (prefix.unsqueeze(1) + offsets.unsqueeze(0))
-                .reshape(-1)
-                .to(torch.int32)
+                (prefix.unsqueeze(1) + offsets.unsqueeze(0)).reshape(-1).to(torch.int32)
             )
             per_query_req = forward_batch.req_pool_indices.long().repeat_interleave(
                 int(ndt)
@@ -1286,8 +1305,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         else:
             max_cols = self.req_to_token.shape[1]
             blk_cols = (
-                torch.arange(max_blocks, device=q.device, dtype=torch.long)
-                * page_size
+                torch.arange(max_blocks, device=q.device, dtype=torch.long) * page_size
             ).clamp(max=max_cols - 1)
             token_slots = self.req_to_token[per_query_req][:, blk_cols]
             block_table = (token_slots // page_size).to(torch.int32)
@@ -1306,9 +1324,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # hotspot). Row results are bit-identical to the unpacked per-query
         # launches (per-row seq_lens, K loaded once under the row-max length).
         pack_verify = (
-            disable_index_value
-            and int(ndt) > 1
-            and num_idx_heads == idx_kv_heads
+            disable_index_value and int(ndt) > 1 and num_idx_heads == idx_kv_heads
         )
         if pack_verify:
             idx_q_score = idx_q.reshape(bs, ndt * num_idx_heads, idx_dim)
@@ -1350,13 +1366,17 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             score_type=self.score_type,
             disable_index_value=disable_index_value,
             packed_seq_lens=pack_verify,
-            # Packed-verify tuning (sweep on benchmark_decode_score.py): bpc=8 /
-            # mc=64 keeps every 16K-128K shape in the faster FILL_ONLY regime
-            # (direct per-block candidate stores) with enough programs to fill
-            # the vector cores -- 2.1x @128K bs=1, ~2.6x @16K bs=16 vs the
-            # flattened default config. Decode keeps the (16, 32) defaults.
+            # Keep a 64-chunk graph for long contexts, but at runtime activate
+            # only 16 chunks while <=256 blocks (32K tokens). This preserves
+            # long-context parallelism while cutting short-context score work;
+            # runtime direct-fill removes register TopK maintenance in both
+            # regimes. A3 full-layer graph A/B is bitwise exact and improves
+            # B1/B4 at 16K as well as B1 at 128K.
             score_blocks_per_chunk=8 if pack_verify else 16,
             score_max_chunks=64 if pack_verify else 32,
+            runtime_fill_only=pack_verify,
+            runtime_score_short_max_blocks=256 if pack_verify else 0,
+            runtime_score_short_chunks=16 if pack_verify else 0,
         )
         if pack_verify:
             # [ndt*H, bs, topk] -> [H, bs*ndt, topk]: packed row m=j*H+h of
@@ -1433,7 +1453,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         per_query_prefix = prefix_lens_l.repeat_interleave(extend_lens)  # [total_q]
         per_query_within = torch.arange(
             total_q, device=device, dtype=torch.long
-        ) - cu_q[:-1].repeat_interleave(extend_lens)  # 0-indexed within each request
+        ) - cu_q[:-1].repeat_interleave(
+            extend_lens
+        )  # 0-indexed within each request
         per_query_seq_lens = (per_query_prefix + per_query_within + 1).to(torch.int32)
 
         max_seqlen = (
@@ -1454,6 +1476,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.prefill_block_score import (
             _build_qblock_mappings as _build_score_qblock_mappings,
         )
+
         qblock_mappings = _build_score_qblock_mappings(
             cu_seqlens,
             seq_lens,
@@ -1517,12 +1540,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         broadcast-add). Extend/prefill runs eager (not cuda-graph captured), so
         ``.item()`` is tolerable, but device ops are kept for speed.
         """
-        from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.flash_block_score_decode import (
-            flash_decode_bnsd_with_topk_idx,
-        )
         from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.topk_sparse_decode import (
             flash_decode_bnsd_with_gqa_share_sparse,
         )
+
         page_size = self.page_size  # == block_size_k
         num_q_heads = q.shape[1]
         head_dim = q.shape[2]
@@ -1603,23 +1624,41 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # dot (no per-query launch overhead, the decode-kernel failure mode).
         from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.prefill_block_score import (
             flash_prefill_bnsd_indexer,
+        )
+        from sglang.srt.layers.attention.minimax_sparse_ops.npu_triton.prefill_block_score import (
             flash_prefill_bnsd_with_topk_idx as _flash_prefill_score_topk,
         )
+
         if disable_index_value:
             idx_o = None
             topk_idx = _flash_prefill_score_topk(
-                idx_q, idx_k_bnsd, cu_seqlens, seq_lens,
-                self.req_to_token, forward_batch.req_pool_indices,
-                block_size_q, page_size, self.topk_blocks,
-                idx_dim**-0.5, self.score_type,
+                idx_q,
+                idx_k_bnsd,
+                cu_seqlens,
+                seq_lens,
+                self.req_to_token,
+                forward_batch.req_pool_indices,
+                block_size_q,
+                page_size,
+                self.topk_blocks,
+                idx_dim**-0.5,
+                self.score_type,
                 qblock_mappings=meta.qblock_mappings,
             )
         else:
             idx_o, topk_idx = flash_prefill_bnsd_indexer(
-                idx_q, idx_k_bnsd, idx_v_bnsd, cu_seqlens, seq_lens,
-                self.req_to_token, forward_batch.req_pool_indices,
-                block_size_q, page_size, self.topk_blocks,
-                idx_dim**-0.5, self.score_type,
+                idx_q,
+                idx_k_bnsd,
+                idx_v_bnsd,
+                cu_seqlens,
+                seq_lens,
+                self.req_to_token,
+                forward_batch.req_pool_indices,
+                block_size_q,
+                page_size,
+                self.topk_blocks,
+                idx_dim**-0.5,
+                self.score_type,
                 qblock_mappings=meta.qblock_mappings,
             )
 
@@ -1722,9 +1761,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         """
         if _npu_use_triton_prefill():
             return True
-        cache_valid = (
-            self._extend_meta is not None
-            and self._extend_meta_key == id(forward_batch)
+        cache_valid = self._extend_meta is not None and self._extend_meta_key == id(
+            forward_batch
         )
         if cache_valid and hasattr(self._extend_meta, "triton_prefill_gate"):
             return self._extend_meta.triton_prefill_gate
@@ -1819,7 +1857,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                         dtype=torch.int32,
                         device=forward_batch.extend_seq_lens.device,
                     ),
-                    forward_batch.extend_seq_lens.to(torch.int32).cumsum(0).to(torch.int32),
+                    forward_batch.extend_seq_lens.to(torch.int32)
+                    .cumsum(0)
+                    .to(torch.int32),
                 ]
             )
             seq_lens = forward_batch.seq_lens.to(torch.int32)  # prefix + extend

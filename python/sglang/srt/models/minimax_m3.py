@@ -492,7 +492,6 @@ class MiniMaxM3MoE(nn.Module):
                 or forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_decode()
             )
-            and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
         )
         if hidden_states.shape[0] > 0:
             router_logits = self._compute_router_logits(hidden_states)

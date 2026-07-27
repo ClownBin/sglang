@@ -329,7 +329,7 @@ class Envs:
     # path for ALL prefill lengths (long AND short); respects the master kill-
     # switch SGLANG_MINIMAX_NPU_TRITON. E2e (dp4/ctx32768): triton wins >=16K
     # (1.45x @16K, >7x @24K), loses <=8K -- hence the adaptive default.
-    SGLANG_MINIMAX_NPU_TRITON_PREFILL = EnvBool(True)
+    SGLANG_MINIMAX_NPU_TRITON_PREFILL = EnvBool(False)
 
     # MiniMax M3 NPU prefill MAIN-attention PACK_Q shared-topk kernel
     # (`_gqa_share_sparse_prefill_blockq_kernel`). The blockq path is engaged
@@ -606,6 +606,8 @@ class Envs:
     # Quantize x to int8 in the dispatch operator
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False) # This argument is deprecated
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
+    # Opt-in MiniMax-M3 prefill path using the dedicated normal-mode FuseEP operator.
+    SGLANG_ENABLE_M3_FUSEEP_PREFILL = EnvBool(False)
 
     # MTHREADS & MUSA
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)

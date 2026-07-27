@@ -83,6 +83,93 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
             "NPU must avoid the torch.compile/Triton swigluoai helper.",
         )
 
+    def test_fuseep_prefill_uses_global_dp_extend_mode(self):
+        source = _read("python/sglang/srt/models/minimax_m3.py")
+
+        self.assertIn("get_is_extend_in_batch", source)
+        self.assertRegex(
+            source,
+            r"forward_batch\.forward_mode\.is_extend\(\)\s+or\s+\(\s*"
+            r"is_dp_attention_enabled\(\)\s+and\s+get_is_extend_in_batch\(\)\s*\)",
+            "M3 FuseEP must include idle DP-attention ranks in an extend EP collective.",
+        )
+        self.assertIn(
+            'getattr(topk_output, "expert_location_dispatch_info", None)', source
+        )
+        self.assertIn("m3_fuseep_num_input_tokens", source)
+        self.assertIn("if is_extend_in_batch and dp_global_num_tokens is not None", source)
+
+    def test_fuseep_normal_mode_is_extend_only(self):
+        source = _read("python/sglang/srt/models/minimax_m3.py")
+
+        self.assertRegex(
+            source,
+            r"(?s)use_m3_fuseep_normal\s*=\s*\(.*?"
+            r"and is_extend_in_batch\s+"
+            r"and getattr\(topk_output, \"expert_location_dispatch_info\", None\) is None",
+        )
+
+    def test_low_latency_fuseep_replaces_invalid_expert_ids(self):
+        source = _read("python/sglang/srt/hardware_backend/npu/moe/fuseep.py")
+        low_latency_source = source[
+            source.index("is_idle_dp_rank = is_dp_attention_enabled()") :
+        ]
+
+        self.assertIn(
+            "topk_ids = topk_ids.masked_fill(topk_ids < 0, 0)",
+            low_latency_source,
+        )
+
+    def test_ascend_fuseep_uses_a2a_moe_forward(self):
+        source = _read("python/sglang/srt/models/minimax_m3.py")
+
+        self.assertRegex(
+            source,
+            r"get_moe_a2a_backend\(\)\.is_deepep\(\)\s+or\s+"
+            r"get_moe_a2a_backend\(\)\.is_ascend_fuseep\(\)",
+            "Ascend FuseEP must use M3's A2A MoE forward path.",
+        )
+
+    def test_m3_fuseep_kwargs_are_not_passed_to_deepep(self):
+        source = _read("python/sglang/srt/models/minimax_m3.py")
+
+        self.assertIn(
+            "if get_moe_a2a_backend().is_ascend_fuseep():\n"
+            "            final_hidden_states = self.experts(",
+            source,
+        )
+
+    def test_fuseep_workspace_uses_global_dp_tokens(self):
+        source = _read("python/sglang/srt/hardware_backend/npu/moe/fuseep.py")
+
+        self.assertIn("get_dp_global_num_tokens", source)
+        self.assertIn(
+            "num_input_tokens = max(num_input_tokens, sum(global_num_tokens))",
+            source,
+        )
+        self.assertIn("is_idle_dp_rank", source)
+        self.assertIn("return hidden_states[:num_output_tokens]", source)
+        self.assertIn("if not is_dp_attention_enabled():", source)
+        self.assertIn("normal_decode and hidden_states.shape[0] < 128", source)
+
+    def test_fuseep_scale_preserves_expert_dimension(self):
+        source = _read("python/sglang/srt/hardware_backend/npu/moe/fuseep.py")
+
+        self.assertIn(
+            ").reshape(scale.shape).to(scale.device)", source
+        )
+
+    def test_fuseep_copies_dp_gathered_input(self):
+        source = _read("python/sglang/srt/hardware_backend/npu/moe/fuseep.py")
+
+        self.assertIn("hidden_states = hidden_states.clone()", source)
+        self.assertIn("topk_weights = torch.ones", source)
+
+    def test_fuseep_replaces_invalid_expert_ids(self):
+        source = _read("python/sglang/srt/hardware_backend/npu/moe/fuseep.py")
+
+        self.assertIn("topk_ids.masked_fill(topk_ids < 0, 0)", source)
+
     def test_dense_mlp_accepts_decoder_layer_call_signature(self):
         source = _read("python/sglang/srt/models/minimax_m3.py")
         tree = ast.parse(source)

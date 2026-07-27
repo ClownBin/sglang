@@ -35,35 +35,6 @@ def _mask_padded_tokens(
     topk_weights.masked_fill_(padding_mask, 0.0)
 
 
-def _biased_sigmoid_topk_torch_npu(
-    router_logits: torch.Tensor,
-    topk_config: "TopKConfig",
-    num_token_non_padded: Optional[torch.Tensor],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    scores = router_logits.to(torch.float32).sigmoid()
-    scores_for_choice = scores + topk_config.correction_bias.to(torch.float32)
-    _, topk_ids = torch.topk(
-        scores_for_choice,
-        k=topk_config.top_k,
-        dim=-1,
-        sorted=False,
-    )
-    topk_weights = scores.gather(1, topk_ids)
-
-    if topk_config.renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-        if topk_config.apply_routed_scaling_factor_on_output:
-            topk_weights = topk_weights * (
-                topk_config.routed_scaling_factor
-                if topk_config.routed_scaling_factor is not None
-                else 1.0
-            )
-
-    topk_weights = topk_weights.to(torch.float32)
-    topk_ids = topk_ids.to(torch.int32)
-    return topk_weights, topk_ids
-
-
 def fused_topk_npu(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -117,21 +88,6 @@ def fused_topk_npu(
         else:
             topk_weights = topk_weights * topk_config.routed_scaling_factor
         topk_weights = topk_weights.to(torch.float32)
-
-    # MiniMax-M3 uses sigmoid routing with correction bias. The bias must only
-    # affect expert selection; combine weights come from the original sigmoid
-    # scores, then get normalized and scaled.
-    elif (
-        not use_grouped_topk
-        and correction_bias is not None
-        and scoring_func == "sigmoid"
-        and topk_config.num_fused_shared_experts == 0
-    ):
-        topk_weights, topk_ids = _biased_sigmoid_topk_torch_npu(
-            router_logits, topk_config, num_token_non_padded
-        )
-
-    # Support grouped top-k or correction bias or sigmoid or routed_scaling_factor
     elif (
         correction_bias is not None
         or scoring_func == "sigmoid"

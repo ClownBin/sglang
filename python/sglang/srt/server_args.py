@@ -5691,11 +5691,6 @@ class ServerArgs:
                 assert (
                     self.quantization == "modelslim"
                 ), "When fuse_mode is set to 2, the NPU supports only ModelSlim quantization."
-            if envs.SGLANG_ENABLE_M3_FUSEEP_PREFILL.get() and fuse_mode != 2:
-                raise ValueError(
-                    "SGLANG_ENABLE_M3_FUSEEP_PREFILL requires "
-                    "SGLANG_NPU_FUSED_MOE_MODE=2."
-                )
         if self.moe_a2a_backend == "flashinfer":
             assert (
                 self.enable_dp_attention and self.dp_size == self.tp_size

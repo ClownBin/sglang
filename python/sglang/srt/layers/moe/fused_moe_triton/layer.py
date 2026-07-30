@@ -3,7 +3,9 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
 import logging
-from enum import Enum
+import math
+from dataclasses import dataclass
+from enum import Enum, IntEnum
 from functools import cached_property
 from typing import List, Optional, Tuple
 
@@ -133,6 +135,59 @@ class FusedMoeWeightScaleSupported(Enum):
     BLOCK = "block"
 
 
+class FuseEPActivationType(IntEnum):
+    SWIGLU = 0
+    SWIGLU_OAI = 1
+
+
+@dataclass(frozen=True)
+class FuseEPActivationConfig:
+    activation_type: FuseEPActivationType = FuseEPActivationType.SWIGLU
+    alpha: Optional[float] = None
+    gate_clamp_max: Optional[float] = None
+    up_clamp_min: Optional[float] = None
+    up_clamp_max: Optional[float] = None
+    up_add: Optional[float] = None
+
+    def validate(self) -> None:
+        try:
+            activation_type = FuseEPActivationType(self.activation_type)
+        except ValueError as exc:
+            raise ValueError(
+                f"Unsupported FuseEP activation type: {self.activation_type}"
+            ) from exc
+
+        if activation_type == FuseEPActivationType.SWIGLU:
+            return
+
+        values = (
+            self.alpha,
+            self.gate_clamp_max,
+            self.up_clamp_min,
+            self.up_clamp_max,
+            self.up_add,
+        )
+        if any(value is None for value in values):
+            raise ValueError("SwiGLU-OAI requires all activation parameters")
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("SwiGLU-OAI activation parameters must be finite")
+        if self.up_clamp_min > self.up_clamp_max:
+            raise ValueError("SwiGLU-OAI up_clamp_min must not exceed up_clamp_max")
+
+    def kernel_args(self) -> tuple[int, float, float, float, float, float]:
+        self.validate()
+        if self.activation_type == FuseEPActivationType.SWIGLU:
+            return (int(self.activation_type), 0.0, 0.0, 0.0, 0.0, 0.0)
+        return (
+            int(self.activation_type),
+            self.alpha,
+            self.gate_clamp_max,
+            self.up_clamp_min,
+            self.up_clamp_max,
+            self.up_add,
+        )
+
+
 class FusedMoE(torch.nn.Module):
     """FusedMoE layer for MoE models.
 
@@ -180,6 +235,7 @@ class FusedMoE(torch.nn.Module):
         routing_method_type: Optional[RoutingMethodType] = None,
         is_gated: bool = True,
         gate_up_interleaved: bool = True,
+        fuseep_activation: Optional[FuseEPActivationConfig] = None,
     ):
         super().__init__()
         if params_dtype is None:
@@ -190,6 +246,8 @@ class FusedMoE(torch.nn.Module):
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.num_fused_shared_experts = num_fused_shared_experts
+        self.fuseep_activation = fuseep_activation or FuseEPActivationConfig()
+        self.fuseep_activation.validate()
 
         self.enable_flashinfer_cutlass_moe = (
             get_moe_runner_backend().is_flashinfer_cutlass()
@@ -1103,8 +1161,7 @@ class FusedMoE(torch.nn.Module):
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
-        m3_fuseep_normal: bool = False,
-        m3_fuseep_num_input_tokens: Optional[int] = None,
+        fuseep_normal_mode: Optional[bool] = None,
     ):
         if self._use_ascend_fuseep:
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
@@ -1113,8 +1170,8 @@ class FusedMoE(torch.nn.Module):
                 self,
                 hidden_states,
                 topk_output,
-                m3_fuseep_normal=m3_fuseep_normal,
-                m3_fuseep_num_input_tokens=m3_fuseep_num_input_tokens,
+                fuseep_activation=self.fuseep_activation,
+                fuseep_normal_mode=fuseep_normal_mode,
             )
         if is_in_tc_piecewise_cuda_graph():
             if TopKOutputChecker.format_is_standard(topk_output):

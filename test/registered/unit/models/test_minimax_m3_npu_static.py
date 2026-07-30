@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -14,7 +15,7 @@ def _read(path: str) -> str:
     return (REPO_ROOT / path).read_text()
 
 
-class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
+class TestMiniMaxM3NPUStaticContracts(CustomTestCase):
     def test_model_has_explicit_npu_prepare_path(self):
         source = _read("python/sglang/srt/models/minimax_m3.py")
         tree = ast.parse(source)
@@ -83,42 +84,27 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
             "NPU must avoid the torch.compile/Triton swigluoai helper.",
         )
 
-    def test_fuseep_prefill_uses_global_dp_extend_mode(self):
+    def test_minimax_configures_generic_fuseep_activation(self):
         source = _read("python/sglang/srt/models/minimax_m3.py")
 
-        self.assertIn("get_is_extend_in_batch", source)
-        self.assertRegex(
-            source,
-            r"forward_batch\.forward_mode\.is_extend\(\)\s+or\s+\(\s*"
-            r"is_dp_attention_enabled\(\)\s+and\s+get_is_extend_in_batch\(\)\s*\)",
-            "M3 FuseEP must include idle DP-attention ranks in an extend EP collective.",
-        )
-        self.assertIn(
-            'getattr(topk_output, "expert_location_dispatch_info", None)', source
-        )
-        self.assertIn("m3_fuseep_num_input_tokens", source)
-        self.assertIn("if is_extend_in_batch and dp_global_num_tokens is not None", source)
+        self.assertIn("FuseEPActivationConfig", source)
+        self.assertIn("FuseEPActivationType.SWIGLU_OAI", source)
+        self.assertIn("alpha=config.swiglu_alpha", source)
+        self.assertIn("gate_clamp_max=config.swiglu_limit", source)
+        self.assertIn("up_clamp_min=-config.swiglu_limit", source)
+        self.assertIn("up_clamp_max=config.swiglu_limit", source)
+        self.assertIn("up_add=1.0", source)
 
-    def test_fuseep_normal_mode_is_extend_only(self):
-        source = _read("python/sglang/srt/models/minimax_m3.py")
+    def test_fused_moe_accepts_generic_fuseep_activation(self):
+        source = _read("python/sglang/srt/layers/moe/fused_moe_triton/layer.py")
 
-        self.assertRegex(
-            source,
-            r"(?s)use_m3_fuseep_normal\s*=\s*\(.*?"
-            r"and is_extend_in_batch\s+"
-            r"and getattr\(topk_output, \"expert_location_dispatch_info\", None\) is None",
-        )
+        self.assertIn("class FuseEPActivationType", source)
+        self.assertIn("class FuseEPActivationConfig", source)
+        self.assertIn("fuseep_activation: Optional[FuseEPActivationConfig]", source)
 
     def test_low_latency_fuseep_replaces_invalid_expert_ids(self):
         source = _read("python/sglang/srt/hardware_backend/npu/moe/fuseep.py")
-        low_latency_source = source[
-            source.index("is_idle_dp_rank = is_dp_attention_enabled()") :
-        ]
-
-        self.assertIn(
-            "topk_ids = topk_ids.masked_fill(topk_ids < 0, 0)",
-            low_latency_source,
-        )
+        self.assertIn("topk_ids = topk_ids.masked_fill(topk_ids < 0, 0)", source)
 
     def test_ascend_fuseep_uses_a2a_moe_forward(self):
         source = _read("python/sglang/srt/models/minimax_m3.py")
@@ -130,12 +116,39 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
             "Ascend FuseEP must use M3's A2A MoE forward path.",
         )
 
-    def test_m3_fuseep_kwargs_are_not_passed_to_deepep(self):
+    def test_model_does_not_pass_m3_fuseep_kwargs(self):
         source = _read("python/sglang/srt/models/minimax_m3.py")
 
         self.assertIn(
-            "if get_moe_a2a_backend().is_ascend_fuseep():\n"
-            "            final_hidden_states = self.experts(",
+            "fuseep_normal_mode=is_extend_in_batch",
+            source,
+        )
+        self.assertNotIn("m3_fuseep_", source)
+
+    def test_fuseep_extend_stage_includes_idle_dp_attention_ranks(self):
+        source = _read("python/sglang/srt/models/minimax_m3.py")
+
+        self.assertIn("get_is_extend_in_batch", source)
+        self.assertRegex(
+            source,
+            r"forward_batch\.forward_mode\.is_extend\(\)\s+or\s+\(\s*"
+            r"is_dp_attention_enabled\(\)\s+and\s+hidden_states\.shape\[0\] == 0\s+"
+            r"and\s+get_is_extend_in_batch\(\)\s*\)",
+        )
+
+    def test_fuseep_routes_extend_and_decode_to_distinct_operators(self):
+        source = _read("python/sglang/srt/hardware_backend/npu/moe/fuseep.py")
+
+        self.assertIn("fuseep_normal_mode: Optional[bool] = None", source)
+        self.assertIn("if fuseep_normal_mode is None:", source)
+        self.assertRegex(
+            source,
+            r"if \(\s*fuseep_normal_mode\s+and fuse_mode == "
+            r"FusedMoEMode\.DISPATCH_FFN_COMBINE\.value\s*\):",
+        )
+        self.assertIn("fuse_mode=FusedMoEMode.FUSED_DEEP_MOE.value", source)
+        self.assertIn(
+            "envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()",
             source,
         )
 
@@ -150,7 +163,83 @@ class TestMiniMaxM3NPUStaticContracts(unittest.TestCase):
         self.assertIn("is_idle_dp_rank", source)
         self.assertIn("return hidden_states[:num_output_tokens]", source)
         self.assertIn("if not is_dp_attention_enabled():", source)
-        self.assertIn("normal_decode and hidden_states.shape[0] < 128", source)
+        self.assertNotIn("if hidden_states.shape[0] < 128", source)
+
+    def test_fuseep_uses_generic_activation_and_no_m3_path(self):
+        fuseep_source = _read("python/sglang/srt/hardware_backend/npu/moe/fuseep.py")
+        layer_source = _read("python/sglang/srt/layers/moe/fused_moe_triton/layer.py")
+        environ_source = _read("python/sglang/srt/environ.py")
+
+        self.assertIn("fuseep_activation", fuseep_source)
+        self.assertIn("activation_type=activation_type", fuseep_source)
+        self.assertNotIn("m3_fuseep_normal", fuseep_source)
+        self.assertNotIn("dispatch_ffn_combine_m3", fuseep_source)
+        self.assertNotIn("m3_fuseep_normal", layer_source)
+        self.assertNotIn("SGLANG_ENABLE_M3_FUSEEP_PREFILL", environ_source)
+
+    def test_fuseep_has_no_shape_diagnostic_logging(self):
+        fuseep_source = _read("python/sglang/srt/hardware_backend/npu/moe/fuseep.py")
+        environ_source = _read("python/sglang/srt/environ.py")
+        launch_source = Path(
+            "/home/f00447229/2026-6-16-sglang-minimax-m3/script/fuseep-run/"
+            "minimax-m3-mtp_128_okay_opt_fuseep.sh"
+        ).read_text()
+
+        self.assertNotIn("FuseEP normal input", fuseep_source)
+        self.assertNotIn("SGLANG_DEBUG_FUSEEP_SHAPES", fuseep_source)
+        self.assertNotIn("SGLANG_DEBUG_FUSEEP_SHAPES", environ_source)
+        self.assertNotIn("SGLANG_DEBUG_FUSEEP_SHAPES", launch_source)
+
+    def test_fuseep_m3_opp_keeps_the_standard_kernel_template_abi(self):
+        source = _read(
+            "/home/f00447229/2026-6-16-sglang-minimax-m3/sgl-kernel-npu/"
+            "csrc/deepep/ops/op_kernel/dispatch_ffn_combine.h"
+        )
+
+        self.assertNotIn("bool Oai_", source)
+
+    def test_fuseep_opp_registers_generic_swiglu_oai_operator(self):
+        kernel_root = Path("/home/f00447229/2026-6-16-sglang-minimax-m3/sgl-kernel-npu")
+        definition = (
+            kernel_root
+            / "csrc/deepep/ops/op_host/dispatch_ffn_combine_swiglu_oai_def.cpp"
+        ).read_text()
+        adapter = (
+            kernel_root
+            / "csrc/deepep/ops/op_host/op_api/"
+            "aclnn_dispatch_ffn_combine_swiglu_oai.cpp"
+        ).read_text()
+
+        self.assertIn("class DispatchFFNCombineSwiGluOAI", definition)
+        self.assertIn("OP_ADD(DispatchFFNCombineSwiGluOAI)", definition)
+        self.assertNotIn("M3", definition)
+        for attribute in (
+            "activation_type",
+            "activation_alpha",
+            "gate_clamp_max",
+            "up_clamp_min",
+            "up_clamp_max",
+            "up_add",
+        ):
+            self.assertIn(f'Attr("{attribute}")', definition)
+
+        self.assertIn("aclnnDispatchFFNCombineSwiGluOAIGetWorkspaceSize", adapter)
+        self.assertNotIn("M3", adapter)
+
+        kernel = (
+            kernel_root
+            / "csrc/deepep/ops/op_kernel/"
+            "dispatch_ffn_combine_swi_glu_oai.cpp"
+        ).read_text()
+        self.assertIn("dispatch_ffn_combine_swi_glu_oai", kernel)
+        self.assertIn("#define SGLANG_SWIGLU_OAI", kernel)
+
+        epilogue = (
+            kernel_root
+            / "csrc/deepep/ops/op_kernel/dispatch_ffn_combine_kernel/utils/"
+            "block_epilogue_pertoken_swiglu.hpp"
+        ).read_text()
+        self.assertNotIn("            }\n            }\n#else", epilogue)
 
     def test_fuseep_scale_preserves_expert_dimension(self):
         source = _read("python/sglang/srt/hardware_backend/npu/moe/fuseep.py")

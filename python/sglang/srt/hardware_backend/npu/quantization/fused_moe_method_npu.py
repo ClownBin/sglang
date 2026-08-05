@@ -765,7 +765,7 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         )[0]
 
         if use_swiglu_oai:
-            from sglang.srt.layers.triton_ops.npu_swiglu_oai_quant import (
+            from sgl_kernel_npu.activation.swiglu_oai_quant import (
                 swiglu_oai_quant,
             )
 

@@ -331,39 +331,34 @@ class Envs:
     # (1.45x @16K, >7x @24K), loses <=8K -- hence the adaptive default.
     SGLANG_MINIMAX_NPU_TRITON_PREFILL = EnvBool(True)
 
-    # MiniMax M3 NPU prefill MAIN-attention PACK_Q shared-topk kernel
-    # (`_gqa_share_sparse_prefill_blockq_kernel`). The blockq path is engaged
-    # AUTOMATICALLY by the size-based `_choose_prefill_pack_q` policy whenever
-    # the triton prefill path is active and the input size warrants PACK_Q>1
-    # (PACK_Q=1 falls back to the validated per-query `_decode_main`). This is an
-    # EXPERT A/B / kill-switch only -- force PACK_Q=1 to disable blockq and use
-    # the per-query path; 2/4 to override the adaptive pick. None = adaptive.
-    # UB cap is PACK_Q=4 (gqa=16, D=128, bf16); larger overflows the 192KB UB.
-    SGLANG_MINIMAX_NPU_PREFILL_PACKQ = EnvInt(None)
-
     # MiniMax M3 NPU prefill MAIN-attention: A/B kill-switch to route the sparse
     # main attention through the native Ascend FA op
     # `torch.ops.npu.npu_fused_infer_attention_score` (FIA) with a per-query CUSTOM
-    # block_table, instead of the hand-written triton `_gqa_share_sparse_prefill_blockq_kernel`.
-    # The triton kernel is scalar/fixpipe-bound (aic_mac=3.2%, 9.3ms/call @ production
-    # shape); FIA hits native cube efficiency (~3x faster per token-pair). The native
-    # *sparse* op `npu_sparse_flash_attention` is MLA-only (qk_head_dim=512) and
-    # unusable for MiniMax GQA, so this uses the dense paged FA (FIA) with a custom
-    # block_table listing only each query's selected top-k blocks.
+    # block_table, instead of the hand-written triton per-query kernel
+    # (`flash_decode_bnsd_with_gqa_share_sparse`). The triton kernel is
+    # scalar/fixpipe-bound (aic_mac=3.2%, 9.3ms/call @ production shape); FIA hits
+    # native cube efficiency (~3x faster per token-pair). The native *sparse* op
+    # `npu_sparse_flash_attention` is MLA-only (qk_head_dim=512) and unusable for
+    # MiniMax GQA, so this uses the dense paged FA (FIA) with a custom block_table
+    # listing only each query's selected top-k blocks.
     # Single pass: per-query reorder puts the own (causal) block last, actual_kvlen
     # length-limits it (sparse_mode=0 full-attends the fully-past score blocks).
-    # Default OFF (triton is the validated baseline); set =1 to A/B the FIA path.
+    # Default ON (FIA is the validated baseline); set =0 to fall back to triton.
     SGLANG_MINIMAX_NPU_PREFILL_FIA = EnvBool(True)
 
     # MiniMax M3 NPU native Ascend block-sparse attention (aclnn
     # npu_sparse_attention_score) for the DECODE/VERIFY main attention, replacing
-    # the Triton split-K kernel. DECODE is cuda-graph replay-safe; VERIFY needs a
-    # defensive clamp (see topk_sparse_decode._native_decode_main) and is WIP.
-    # Both default OFF (Triton is the validated baseline).
+    # the Triton split-K kernel. On/off gates read INSIDE the wrapper: ON routes
+    # to the ascend op (the PTA attentions plugin is auto-imported at backend
+    # init, which sets ASCEND_CUSTOM_OPP_PATH -- no manual export needed); OFF
+    # keeps the Triton split-K path. DECODE is cuda-graph replay-safe; VERIFY
+    # needs a defensive clamp (see topk_sparse_decode._native_decode_main) and is
+    # WIP. Both default OFF (Triton is the validated baseline).
     SGLANG_MINIMAX_NPU_NATIVE_DECODE = EnvBool(False)
     SGLANG_MINIMAX_NPU_NATIVE_VERIFY = EnvBool(False)
-    # Path to the vllm_ascend_C.so build of the aclnn op wrapper; required when
-    # either NATIVE_DECODE or NATIVE_VERIFY is on.
+    # Optional path to a vllm_ascend_C.so build of the aclnn op wrapper; used
+    # only when it points to a non-libPTAExtensionOPS .so (then it takes
+    # precedence over the auto-imported PTA plugin). Unset -> PTA auto-import.
     SGLANG_MINIMAX_NPU_NATIVE_SPARSE_LIB = EnvStr("")
 
     # Scheduler: memory leak test

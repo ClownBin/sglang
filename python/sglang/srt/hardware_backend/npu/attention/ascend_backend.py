@@ -99,6 +99,10 @@ class ForwardMetadata:
     actual_seq_lengths_q_pa_cpu: Optional[torch.Tensor] = None
     actual_seq_lengths_kv: Optional[torch.Tensor] = None
 
+    # DSV4 CP prefill: full-batch cu_seqlens kept for the fused compressor
+    # while actual_seq_lengths_q_pa holds the rank-local attention view.
+    dsv4_cp_full_q_pa: Optional[torch.Tensor] = None
+
     # swa attention mask for graph mode decode
     swa_mask: Optional[torch.Tensor] = None
 
@@ -802,7 +806,8 @@ class AscendAttnBackend(AttentionBackend):
                 and _is_dflash_verify(spec_info)
                 and seq_lens_cpu is not None
             ):
-                seq_lens_int = seq_lens_cpu[:bs].int()
+                # seq_lens_cpu may be a CPU tensor; swa_indices is on-device.
+                seq_lens_int = seq_lens_cpu[:bs].int().to(self.device)
             else:
                 seq_lens_int = seq_lens[:bs].int()
             starts = torch.clamp(seq_lens_int - self.sliding_window_size, min=0)
